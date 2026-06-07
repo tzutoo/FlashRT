@@ -20,15 +20,17 @@ try:
         headers={'Content-Type': 'application/json'})
     resp = urllib.request.urlopen(req, timeout=15)
     data = json.loads(resp.read())
+    # Only kill on extreme degradation (< 5 tok/s = GPU corruption).
+    # Normal post-large-context variance can dip to 10-20 tok/s on
+    # tiny 5-token outputs — that's fine, not corruption.
     tok_s = data.get('flashrt', {}).get('decode_tok_per_s', 0)
-    if tok_s > 0 and tok_s < 10:
+    if tok_s > 0 and tok_s < 5:
         print(f'DEGRADED: {tok_s:.1f} tok/s - GPU corrupt, killing server for restart')
         os.kill(1, signal.SIGTERM)
         sys.exit(1)
 except Exception as e:
     # If the healthcheck itself fails (CUDA error, timeout, etc.),
-    # the server is likely in a bad state. Kill PID 1 to trigger
-    # Docker restart.
+    # the server is in a bad state. Kill PID 1 to trigger restart.
     print(f'HEALTH FAIL: {e} - killing server for restart')
     try:
         os.kill(1, signal.SIGTERM)
@@ -37,7 +39,7 @@ except Exception as e:
     sys.exit(1)
 EOF
 
-HEALTHCHECK --interval=20s --timeout=15s --start-period=90s --retries=1 \
+HEALTHCHECK --interval=60s --timeout=15s --start-period=90s --retries=1 \
     CMD python3 /usr/local/bin/healthcheck.py
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--host", "0.0.0.0", "--port", "8000"]

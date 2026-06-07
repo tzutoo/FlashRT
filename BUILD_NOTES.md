@@ -145,10 +145,9 @@ WORKDIR /workspace/FlashRT
 
 EXPOSE 8000
 
-# Health check: sends a tiny completion request and checks decode speed.
-# If GPU is corrupted (from accumulated CUDA graph state), the model still
-# returns HTTP 200 but at 3-5 tok/s instead of 80+. This check catches that
-# and Docker's --restart always will restart the container automatically.
+# Health check: sends a tiny completion request. Only kills on severe
+# degradation (< 5 tok/s = real GPU corruption). Normal post-large-context
+# variance (10-20 tok/s on tiny 5-token outputs) does NOT trigger restart.
 COPY <<'EOF' /usr/local/bin/healthcheck.py
 import urllib.request, json, sys, os, signal
 try:
@@ -159,7 +158,7 @@ try:
     resp = urllib.request.urlopen(req, timeout=15)
     data = json.loads(resp.read())
     tok_s = data.get('flashrt', {}).get('decode_tok_per_s', 0)
-    if tok_s > 0 and tok_s < 10:
+    if tok_s > 0 and tok_s < 5:
         print(f'DEGRADED: {tok_s:.1f} tok/s - GPU corrupt, killing server for restart')
         os.kill(1, signal.SIGTERM)
         sys.exit(1)
@@ -172,7 +171,7 @@ except Exception as e:
     sys.exit(1)
 EOF
 
-HEALTHCHECK --interval=20s --timeout=15s --start-period=90s --retries=1 \
+HEALTHCHECK --interval=60s --timeout=15s --start-period=90s --retries=1 \
     CMD python3 /usr/local/bin/healthcheck.py
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--host", "0.0.0.0", "--port", "8000"]
@@ -214,11 +213,13 @@ for details.
 
 #### The decode-speed healthcheck
 
-The `Dockerfile.server` healthcheck sends a tiny completion request every 20s
-and inspects `decode_tok_per_s`. If the GPU is degraded (under 10 tok/s, indicating
-corruption from CUDA graph state), the healthcheck kills PID 1 to trigger a
-Docker auto-restart. It also kills on any exception (CUDA error, timeout). See the
-[GPU Health Monitoring](#gpu-health-monitoring) section below.
+The `Dockerfile.server` healthcheck sends a tiny completion request every 60s
+and inspects `decode_tok_per_s`. If the GPU is severely degraded (under 5 tok/s,
+indicating real corruption from CUDA graph state), the healthcheck kills PID 1 to
+trigger a Docker auto-restart. It also kills on any exception (CUDA error, timeout).
+The threshold is intentionally conservative: normal post-large-context variance can
+cause tiny 5-token outputs to dip to 10-20 tok/s, which is not corruption.
+See the [GPU Health Monitoring](#gpu-health-monitoring) section below.
 
 #### Re-applying changes after a conflict with upstream
 
@@ -528,7 +529,7 @@ If you still see slow responses at large contexts:
 1. **Reduce context window.** Use `--max-seq 32768` instead of 262208 if your agent prompts stay under 32K.
 2. **Reduce `--default-max-tokens`.** A lower budget (e.g., 512) caps zombie duration even before the cancel fix kicks in.
 3. **Start a new session.** Each client gets a new session by default; old sessions with large accumulated context won't slow new ones.
-4. **Monitor with `docker logs -f`.** Watch the `tok/s` column. If it consistently drops below 20, the GPU is likely corrupt — restart the container.
+4. **Monitor with `docker logs -f`.** Watch the `tok/s` column. If it consistently drops below 5, the GPU is likely corrupt — the healthcheck should auto-restart.
 5. **Use `--warmup-preset agent`** at startup to pre-capture common graph shapes.
 
 ### Recommended startup profiles
@@ -588,17 +589,23 @@ liveness checks. It runs every 20 seconds (after a 90-second start-period) and:
 
 1. Sends a tiny `/v1/chat/completions` request (`"ping"`, `max_tokens=5`).
 2. Reads `flashrt.decode_tok_per_s` from the response.
-3. If throughput is **> 0 but < 10 tok/s** (GPU degraded but still responding), kills
-   PID 1 via `SIGTERM` → Docker's `--restart always` restarts the container.
+3. If throughput is **> 0 but < 5 tok/s** (GPU severely degraded but still responding),
+   kills PID 1 via `SIGTERM` → Docker's `--restart always` restarts the container.
 4. If the request itself fails (CUDA error, timeout, crash), also kills PID 1.
 
 This catches the "GPU corrupt" scenario where the server is technically alive but
 producing at 3-5 tok/s (e.g., after CUDA graph state corruption). Without it,
 Docker considers the container healthy because HTTP 200 is still returned.
 
+The threshold is intentionally conservative at 5 tok/s. During testing, we observed
+that after a large-context session (50K+ tokens), tiny 5-token healthcheck outputs
+regularly dip to 10-20 tok/s due to residual KV cache memory pressure. Setting the
+threshold any higher (e.g., 10 or 20) causes **false-positive restarts** that kill
+a healthy server and disconnect the client mid-session.
+
 | Healthcheck parameter | Value | Why |
 |-----------------------|-------|-----|
-| `--interval` | 20s | Frequent enough to catch degradation quickly |
+| `--interval` | 60s | Avoids false positives and reduces GPU cycles wasted on monitoring |
 | `--timeout` | 15s | Accounts for slow decode at large context |
 | `--start-period` | 90s | Model load + MTP head takes ~30s, plus first warmup |
 | `--retries` | 1 | Kill immediately on first failure — no point retrying a corrupt GPU |
