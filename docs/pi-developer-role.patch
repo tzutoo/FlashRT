@@ -1,0 +1,34 @@
+diff --git a/serving/qwen36_agent/service.py b/serving/qwen36_agent/service.py
+index 2652227..18bf185 100644
+--- a/serving/qwen36_agent/service.py
++++ b/serving/qwen36_agent/service.py
+@@ -752,6 +752,29 @@ def validate_messages(messages: Any) -> List[Dict[str, Any]]:
+     for msg in messages:
+         if not isinstance(msg, dict):
+             raise ValueError("each message must be an object")
++    # Normalize: merge "system" and "developer" contents into one leading system message.
++    sys_contents = [m.get("content", "") for m in messages if m.get("role") == "system"]
++    dev_contents = [m.get("content", "") for m in messages if m.get("role") == "developer"]
++    merged_parts = [c for c in sys_contents + dev_contents if c]
++    if not merged_parts:
++        merged_parts = ["You are a helpful assistant."]
++    filtered = [m for m in messages if m.get("role") not in ("system", "developer")]
++    filtered.insert(0, {"role": "system", "content": "\n\n".join(merged_parts)})
++    messages = filtered
++    # Flatten list-style content blocks to a plain string. OpenAI accepts both,
++    # but some clients (e.g. pi) always send a list of {type:"text", text:...}.
++    for msg in messages:
++        content = msg.get("content")
++        if isinstance(content, list):
++            text_parts = []
++            for part in content:
++                if isinstance(part, dict):
++                    if part.get("type") == "text" and isinstance(part.get("text"), str):
++                        text_parts.append(part["text"])
++                    elif isinstance(part.get("text"), str):
++                        text_parts.append(part["text"])
++            msg["content"] = "\n".join(text_parts)
++    for msg in messages:
+         role = msg.get("role")
+         if role not in ("system", "user", "assistant", "tool"):
+             raise ValueError(f"unsupported role: {role!r}")

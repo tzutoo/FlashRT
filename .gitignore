@@ -44,3 +44,13 @@ internal-tests/
 internal-docs/
 notes/
 third_party/cutlass
+# --- Fork-local (tzutoo) ---
+# These are not safe to commit upstream. The model dirs are too big; the
+# opencode.json contains personal API keys.
+
+# Model checkpoints (29 GB + 26 GB)
+qwen36_fp8/
+qwen36_nvfp4/
+
+# Personal opencode config (API keys)
+opencode.json

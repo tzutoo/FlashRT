@@ -1,0 +1,13 @@
+FROM flashrt:5090
+
+RUN pip install --quiet --no-cache-dir fastapi uvicorn 'transformers<4.56'
+
+COPY serving/ /workspace/FlashRT/serving/
+WORKDIR /workspace/FlashRT
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')" || exit 1
+
+CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--host", "0.0.0.0", "--port", "8000"]
