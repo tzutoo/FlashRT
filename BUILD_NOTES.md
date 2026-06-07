@@ -174,7 +174,7 @@ EOF
 HEALTHCHECK --interval=60s --timeout=15s --start-period=90s --retries=1 \
     CMD python3 /usr/local/bin/healthcheck.py
 
-CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--default-max-tokens", "8192", "--max-output-tokens", "16384", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 
@@ -281,9 +281,10 @@ docker run --restart always --gpus all --ipc=host \
     flashrt-server:5090
 ```
 
-The Dockerfile bakes in `--max-seq 262208` (256K context). The server's default
-`--default-max-tokens` is 2048; override at the `docker run` command line if needed
-(e.g., `--default-max-tokens 1024` for agent workloads).
+The Dockerfile bakes in `--max-seq 262208` (256K context), `--default-max-tokens 8192`,
+and `--max-output-tokens 16384`. Clients get 8192 output tokens by default; if a client
+explicitly requests more (up to 16384), the server allows it. Override at the
+`docker run` command line if needed.
 
 | Flag | Purpose |
 |------|---------|
@@ -407,7 +408,7 @@ The container defaults to K=4 (best for tool-call agent workloads per FlashRT be
 | Limitation | Details |
 |------------|---------|
 | Greedy decode only | No temperature/top_p/top_k. Speculative decode verify uses argmax. The server accepts but ignores sampling params. |
-| Tool call truncation | Default `--default-max-tokens` is 2048 (server code default, not in Dockerfile). Tool calls truncated before closing tags become plain text. Consider overriding to 4096+ via CLI. |
+| Tool call truncation | Fixed: `--default-max-tokens 8192` now baked into Dockerfile CMD. Previously defaulted to 2048, causing truncated outputs. Hard cap is `--max-output-tokens 16384`. |
 | Single tool call per turn | Server stops generation on first complete tool call. Multiple tool calls in one response not captured. |
 | NVFP4 hardcoded | Engine uses `quant="nvfp4"`. Switching to FP8 requires engine + kernel changes. |
 | Thinking mode disabled | `enable_thinking` defaults to false. Enabling it may improve tool selection accuracy at cost of more tokens. |
@@ -527,7 +528,7 @@ sid=frt-4eaf993ca359471a8a12f073 | tok p=30149 | decode=118257.6ms | speed=5.3 t
 If you still see slow responses at large contexts:
 
 1. **Reduce context window.** Use `--max-seq 32768` instead of 262208 if your agent prompts stay under 32K.
-2. **Reduce `--default-max-tokens`.** A lower budget (e.g., 512) caps zombie duration even before the cancel fix kicks in.
+2. **Reduce `--default-max-tokens`.** A lower budget (e.g., 4096) caps zombie duration even before the cancel fix kicks in.
 3. **Start a new session.** Each client gets a new session by default; old sessions with large accumulated context won't slow new ones.
 4. **Monitor with `docker logs -f`.** Watch the `tok/s` column. If it consistently drops below 5, the GPU is likely corrupt — the healthcheck should auto-restart.
 5. **Use `--warmup-preset agent`** at startup to pre-capture common graph shapes.
@@ -553,7 +554,7 @@ docker run --restart always --gpus all --ipc=host \
     -e FLASHRT_QWEN36_LONG_KV_CACHE=fp8 \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     flashrt-server:5090 \
-    --max-seq 32768 --default-max-tokens 1024
+    --max-seq 32768 --default-max-tokens 4096 --max-output-tokens 8192
 
 # Long-context mode (for RAG / doc-QA / very long sessions)
 # - 128K context, TTFT up to ~27s at full context
