@@ -7,7 +7,37 @@ WORKDIR /workspace/FlashRT
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')" || exit 1
+# Health check: sends a tiny completion request and checks decode speed.
+# If GPU is corrupted (from accumulated CUDA graph state), the model still
+# returns HTTP 200 but at 3-5 tok/s instead of 80+. This check catches that
+# and Docker's --restart always will restart the container automatically.
+COPY <<'EOF' /usr/local/bin/healthcheck.py
+import urllib.request, json, sys, os, signal
+try:
+    req = urllib.request.Request(
+        'http://localhost:8000/v1/chat/completions',
+        json.dumps({'model': 'qwen36-27b', 'messages': [{'role': 'user', 'content': 'ping'}], 'max_tokens': 5}).encode(),
+        headers={'Content-Type': 'application/json'})
+    resp = urllib.request.urlopen(req, timeout=15)
+    data = json.loads(resp.read())
+    tok_s = data.get('flashrt', {}).get('decode_tok_per_s', 0)
+    if tok_s > 0 and tok_s < 10:
+        print(f'DEGRADED: {tok_s:.1f} tok/s - GPU corrupt, killing server for restart')
+        os.kill(1, signal.SIGTERM)
+        sys.exit(1)
+except Exception as e:
+    # If the healthcheck itself fails (CUDA error, timeout, etc.),
+    # the server is likely in a bad state. Kill PID 1 to trigger
+    # Docker restart.
+    print(f'HEALTH FAIL: {e} - killing server for restart')
+    try:
+        os.kill(1, signal.SIGTERM)
+    except Exception:
+        pass
+    sys.exit(1)
+EOF
+
+HEALTHCHECK --interval=20s --timeout=15s --start-period=90s --retries=1 \
+    CMD python3 /usr/local/bin/healthcheck.py
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--host", "0.0.0.0", "--port", "8000"]

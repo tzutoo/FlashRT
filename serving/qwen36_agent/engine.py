@@ -66,11 +66,17 @@ class AgentEngine(Protocol):
         """
         ...
 
-    def generate_stream(self, *, max_tokens: int, K: int) -> Iterable[DecodeChunk]:
+    def generate_stream(self, *, max_tokens: int, K: int,
+                        cancel=None) -> Iterable[DecodeChunk]:
         """Yield committed decode chunks.
 
         Chunks may contain more than one token because FlashRT flushes at
         speculative accept boundaries.  They must not include uncommitted
         lookahead tokens.
+
+        ``cancel`` is an optional ``threading.Event``.  When set, the engine
+        should stop generating as soon as practical (checked between decode
+        steps, not mid-GPU-operation).  This prevents zombie GPU work after a
+        client disconnect.
         """
         ...

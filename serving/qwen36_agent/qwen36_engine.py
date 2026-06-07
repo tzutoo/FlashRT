@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Sequence
+
+log = logging.getLogger("qwen36_agent")
 
 from .engine import DecodeChunk
 
@@ -367,17 +371,22 @@ class Qwen36FrontendAgentEngine:
         self._last_prompt_tokens = prompt_len
 
     def generate_stream(self, *, max_tokens: int,
-                        K: int) -> Iterable[DecodeChunk]:
+                        K: int,
+                        cancel: Any = None) -> Iterable[DecodeChunk]:
         stop_ids = self._visible_stop_token_ids()
         if self._last_route == "long":
             chunks = self._committed_stream(
                 self.fe.decode_long_ctx_nvfp4_committed_stream,
-                max_tokens=max_tokens, K=K, stop_ids=stop_ids)
+                max_tokens=max_tokens, K=K, stop_ids=stop_ids,
+                cancel=cancel)
         else:
             chunks = self._committed_stream(
                 self.fe.decode_own_speculative_nvfp4_committed_stream,
-                max_tokens=max_tokens, K=K, stop_ids=stop_ids)
+                max_tokens=max_tokens, K=K, stop_ids=stop_ids,
+                cancel=cancel)
         for token_chunk in chunks:
+            if cancel is not None and cancel.is_set():
+                return
             ids = tuple(int(t) for t in token_chunk)
             stop_at = next(
                 (i for i, tok in enumerate(ids) if tok in stop_ids), None)
@@ -404,14 +413,24 @@ class Qwen36FrontendAgentEngine:
             break
 
     @staticmethod
-    def _committed_stream(fn, *, max_tokens: int, K: int, stop_ids: set[int]):
+    def _committed_stream(fn, *, max_tokens: int, K: int, stop_ids: set[int],
+                          cancel: Any = None):
         try:
-            return fn(max_new_tokens=int(max_tokens), K=int(K),
-                      stop_token_ids=tuple(int(t) for t in stop_ids))
+            gen = fn(max_new_tokens=int(max_tokens), K=int(K),
+                     stop_token_ids=tuple(int(t) for t in stop_ids))
         except TypeError as exc:
             if "stop_token_ids" not in str(exc):
                 raise
-            return fn(max_new_tokens=int(max_tokens), K=int(K))
+            gen = fn(max_new_tokens=int(max_tokens), K=int(K))
+        chunk_count = 0
+        for chunk in gen:
+            if cancel is not None and cancel.is_set():
+                log.warning(
+                    "committed_stream cancelled after %d chunks, "
+                    "stopping decode early", chunk_count)
+                return
+            chunk_count += 1
+            yield chunk
 
     def _visible_stop_token_ids(self) -> set[int]:
         tokenizer = self.fe._tokenizer

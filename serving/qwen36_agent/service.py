@@ -121,20 +121,49 @@ class AgentService:
 
     def stream_openai(self, req: AgentRequest, *,
                       model: str) -> Iterable[str]:
-        with self._lock:
-            completed = False
-            self._active_stream_committed = False
-            try:
-                yield from self._stream_openai(req, model=model)
-                completed = True
-            finally:
-                # Client disconnect closes this generator (GeneratorExit) before
-                # the final commit / mark, and an exception aborts it too. Either
-                # way the frontend state advanced past the journal, so clear the
-                # hot session and force the next turn to rebuild.
-                if not completed and not self._active_stream_committed:
-                    self.sessions.hot_session_id = None
+        cancel = threading.Event()
+        # Run prefill + decode under the lock, but collect results into a
+        # queue. SSE yields happen OUTSIDE the lock so client disconnect
+        # can abort the outer generator immediately without deadlocking.
+        import queue
+        sse_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+        def _generate():
+            """Run prefill+decode under the lock, push SSE chunks to queue."""
+            with self._lock:
+                committed = False
                 self._active_stream_committed = False
+                try:
+                    for sse_chunk in self._stream_openai(
+                            req, model=model, cancel=cancel):
+                        sse_queue.put(sse_chunk)
+                    committed = True
+                finally:
+                    cancel.set()
+                    if not committed and not self._active_stream_committed:
+                        self.sessions.hot_session_id = None
+                    self._active_stream_committed = False
+                    sse_queue.put(None)  # sentinel: generation done
+
+        gen_thread = threading.Thread(target=_generate, daemon=True)
+        gen_thread.start()
+        try:
+            while True:
+                try:
+                    item = sse_queue.get(timeout=0.2)
+                except queue.Empty:
+                    if not gen_thread.is_alive():
+                        break
+                    continue
+                if item is None:
+                    break
+                yield item
+        except GeneratorExit:
+            # Client disconnected — signal cancel so the GPU thread
+            # stops within one decode cycle (~100ms), then release
+            # the lock.
+            cancel.set()
+            raise
 
     def _effective_plan(
             self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:
@@ -601,7 +630,9 @@ class AgentService:
         )
 
     def _stream_openai(self, req: AgentRequest, *,
-                       model: str) -> Iterable[str]:
+                       model: str,
+                       cancel: Optional[threading.Event] = None
+                       ) -> Iterable[str]:
         """Yield OpenAI-compatible SSE chunks as decode commits tokens."""
         if req.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
@@ -651,15 +682,54 @@ class AgentService:
         backend_decode_ms = 0.0
         saw_tool_call = False
         chunks = iter(self.engine.generate_stream(max_tokens=max_tokens,
-                                                  K=decode_k))
+                                                  K=decode_k,
+                                                  cancel=cancel))
         while True:
+            # Run next(chunks) in a thread so cancel.is_set() can interrupt
+            # the GPU decode loop even when the frontend's while loop is
+            # blocked on a CUDA kernel.
+            next_result: list = [None]
+            next_exc: list = [None]
+
+            def _fetch_chunk():
+                try:
+                    next_result[0] = next(chunks)
+                except StopIteration:
+                    next_result[0] = StopIteration
+                except Exception as exc:
+                    next_exc[0] = exc
+
+            fetcher = threading.Thread(target=_fetch_chunk, daemon=True)
+            fetcher.start()
             next_t0 = time.perf_counter()
-            try:
-                chunk = next(chunks)
-            except StopIteration:
+            fetcher.join(timeout=0.1)
+            while fetcher.is_alive():
+                if cancel is not None and cancel.is_set():
+                    log.warning(
+                        "stream cancelled after %d tokens "
+                        "(client disconnect?), stopping decode early",
+                        len(generated_ids))
+                    # Wait briefly for the GPU op to finish so we don't
+                    # corrupt state, then break out.
+                    fetcher.join(timeout=5.0)
+                    # If still alive, the GPU op is stuck. The healthcheck
+                    # will catch the degraded state and restart.
+                    cancel_was_set = True
+                    break
+                fetcher.join(timeout=0.1)
+            else:
+                cancel_was_set = False
+
+            if cancel is not None and cancel.is_set() and cancel_was_set:
+                break
+
+            if next_exc[0] is not None:
+                raise next_exc[0]
+            if next_result[0] is StopIteration:
                 backend_decode_ms += (
                     time.perf_counter() - next_t0) * 1000.0
                 break
+            chunk = next_result[0]
             backend_decode_ms += (time.perf_counter() - next_t0) * 1000.0
             generated_ids.extend(int(t) for t in chunk.token_ids)
             if getattr(chunk, "state_lookahead", 0):
@@ -752,6 +822,29 @@ def validate_messages(messages: Any) -> List[Dict[str, Any]]:
     for msg in messages:
         if not isinstance(msg, dict):
             raise ValueError("each message must be an object")
+    # Normalize: merge "system" and "developer" contents into one leading system message.
+    sys_contents = [m.get("content", "") for m in messages if m.get("role") == "system"]
+    dev_contents = [m.get("content", "") for m in messages if m.get("role") == "developer"]
+    merged_parts = [c for c in sys_contents + dev_contents if c]
+    if not merged_parts:
+        merged_parts = ["You are a helpful assistant."]
+    filtered = [m for m in messages if m.get("role") not in ("system", "developer")]
+    filtered.insert(0, {"role": "system", "content": "\n\n".join(merged_parts)})
+    messages = filtered
+    # Flatten list-style content blocks to a plain string. OpenAI accepts both,
+    # but some clients (e.g. pi) always send a list of {type:"text", text:...}.
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text" and isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
+                    elif isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
+            msg["content"] = "\n".join(text_parts)
+    for msg in messages:
         role = msg.get("role")
         if role not in ("system", "user", "assistant", "tool"):
             raise ValueError(f"unsupported role: {role!r}")
