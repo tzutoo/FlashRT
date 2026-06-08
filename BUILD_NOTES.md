@@ -96,20 +96,20 @@ git clone https://github.com/flash-rt/FlashRT.git
 cd FlashRT
 
 # Build — must cap parallelism to avoid OOM during nvcc compilation
-docker build -t flashrt:5090 \
+docker build --progress=plain -t flashrt:5090 \
     -f docker/Dockerfile \
     --build-arg GPU_ARCH=120 \
-    --build-arg JOBS=8 \
     --build-arg FA2_ARCH_NATIVE_ONLY=ON \
-    .
+    --build-arg FA2_HDIMS="128;256" \
+    . 2>&1
 ```
 
 ### Build Notes
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| `JOBS=8` | 8 parallel nvcc threads | Peak ~16-24 GB RAM during compilation. With 35 GB WSL2 RAM, uncapped parallelism (default = nproc) causes OOM or multi-hour hangs |
-| `FA2_ARCH_NATIVE_ONLY=ON` | Skip sm_80 + compute120 PTX | Only builds native SM120 SASS for FlashAttention2. ~66% less FA2 compilation work |
+| `FA2_ARCH_NATIVE_ONLY=ON` | Skip sm_80 + compute_120 PTX | Only builds native SM120 SASS for FlashAttention2. ~66% less FA2 compilation work |
+| `FA2_HDIMS="128;256"` | Restrict FA2 head dims | Only compile the hdim=128 and hdim=256 kernels Qwen3.6 uses. Skips hdim=96 |
 | `GPU_ARCH=120` | Target RTX 5090 | Required for Blackwell support |
 
 Expected build time: **~5 minutes** for CUDA kernel compilation (282s measured).
@@ -117,10 +117,10 @@ Expected build time: **~5 minutes** for CUDA kernel compilation (282s measured).
 Smoke test inside the image:
 ```bash
 docker run --rm --gpus all flashrt:5090 \
-    python3 -c "import flash_rt; print('flash_rt', flash_rt.__version__); from flash_rt import flash_rt_kernels; print('kernels OK')"
+    python3 -c "import flash_rt; print('flash_rt', flash_rt.__version__); from flash_rt import flash_rt_kernels, flash_rt_fa2; print('kernels + fa2 OK')"
 ```
 
-Expected output: `flash_rt 0.1.0` + `kernels OK`
+Expected output: `flash_rt 0.1.0` + `kernels + fa2 OK`
 
 ---
 
@@ -131,7 +131,7 @@ No pip install at runtime — faster startup.
 
 ```bash
 # From the FlashRT repo root
-docker build -t flashrt-server:5090 -f Dockerfile.server .
+docker build --progress=plain -t flashrt-server:5090 -f Dockerfile.server . 2>&1
 ```
 
 `Dockerfile.server`:
@@ -191,7 +191,7 @@ The fork carries **three** sets of local changes on top of upstream, all committ
 These are already committed — just build:
 
 ```bash
-docker build -t flashrt-server:5090 -f Dockerfile.server .
+docker build --progress=plain -t flashrt-server:5090 -f Dockerfile.server . 2>&1
 ```
 
 #### The pi developer-role patch
@@ -277,7 +277,10 @@ docker run --restart always --gpus all --ipc=host \
     -v $(pwd)/qwen36_fp8:/fp8:ro \
     -e FLASHRT_QWEN36_MTP_CKPT_DIR=/fp8 \
     -e FLASHRT_QWEN36_LONG_KV_CACHE=fp8 \
+    -e FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ=512 \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -e HF_HUB_OFFLINE=1 \
+    -e TRANSFORMERS_OFFLINE=1 \
     flashrt-server:5090
 ```
 
@@ -294,6 +297,9 @@ explicitly requests more (up to 16384), the server allows it. Override at the
 | `-p 8000:8000` | Expose server port |
 | `MTP_CKPT_DIR=/fp8` | MTP head location (speculative decode) |
 | `LONG_KV_CACHE=fp8` | FP8 KV cache for 256K context |
+| `LONG_CTX_ROUTE_MIN_SEQ=512` | Route prompts ≥512 tokens through chunked FP8-KV |
+| `HF_HUB_OFFLINE=1` | Don't phone home to HuggingFace Hub |
+| `TRANSFORMERS_OFFLINE=1` | Same for transformers library |
 | `/nvfp4:ro` / `/fp8:ro` | Read-only model mounts |
 
 Startup takes ~30 seconds (model loading + MTP head). Verify:
@@ -449,7 +455,7 @@ FlashRT/
 | Problem | Solution |
 |---------|----------|
 | Build hangs for hours | Ensure `JOBS=8` and `FA2_ARCH_NATIVE_ONLY=ON`. Uncapped parallelism OOMs in WSL2's 35 GB RAM |
-| `ImportError: flash_rt_kernels` | Rebuild base image. `.so` files must land in `flash_rt/` |
+| `ImportError: flash_rt_kernels` or `flash_rt_fa2` | Rebuild base image. Both `.so` files must land in `flash_rt/` |
 | opencode says "Not Found" | Provider must be a **custom name** (e.g. `flashrt`), not the built-in `openai`. Must include `npm: "@ai-sdk/openai-compatible"` |
 | Server unreachable from opencode | Container must bind `0.0.0.0` (not `127.0.0.1`). `baseURL` must include `/v1` suffix |
 | `ModuleNotFoundError: serving.qwen36_agent.qwen36_engine` | Server image must COPY the full `serving/` directory and set `WORKDIR /workspace/FlashRT` |
@@ -552,7 +558,10 @@ docker run --restart always --gpus all --ipc=host \
     -v $(pwd)/qwen36_fp8:/fp8:ro \
     -e FLASHRT_QWEN36_MTP_CKPT_DIR=/fp8 \
     -e FLASHRT_QWEN36_LONG_KV_CACHE=fp8 \
+    -e FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ=512 \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -e HF_HUB_OFFLINE=1 \
+    -e TRANSFORMERS_OFFLINE=1 \
     flashrt-server:5090 \
     --max-seq 32768 --default-max-tokens 4096 --max-output-tokens 8192
 

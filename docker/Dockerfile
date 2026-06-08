@@ -32,6 +32,10 @@ FROM ${BASE_IMAGE}
 ARG GPU_ARCH=""
 ARG CUTLASS_REF=v4.4.2
 ARG FA2_HDIMS=""
+ARG FA2_ARCH_NATIVE_ONLY=""
+#   JOBS   cap cmake parallelism (default: nproc).  In WSL2 with
+#          limited RAM, set JOBS=8 to avoid OOM during nvcc.
+ARG JOBS=""
 
 # ── Tiny base utilities (NGC image already has cmake/ninja/git, but
 #    pin in case a future base image drops one of them). ──
@@ -77,7 +81,8 @@ RUN mkdir -p third_party && ln -sfn /opt/cutlass third_party/cutlass
 RUN cmake -B build -S . \
         $( [ -n "${GPU_ARCH}" ] && echo "-DGPU_ARCH=${GPU_ARCH}" ) \
         $( [ -n "${FA2_HDIMS}" ] && echo "-DFA2_HDIMS=${FA2_HDIMS}" ) \
- && cmake --build build -j"$(nproc)" \
+        $( [ -n "${FA2_ARCH_NATIVE_ONLY}" ] && echo "-DFA2_ARCH_NATIVE_ONLY=${FA2_ARCH_NATIVE_ONLY}" ) \
+ && cmake --build build -j"${JOBS:-$(nproc)}" --target flash_rt_kernels flash_rt_fa2 \
  && rm -rf build/CMakeFiles
 
 # ── Editable install — registers flash_rt with the system Python so
