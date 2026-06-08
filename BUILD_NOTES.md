@@ -174,7 +174,7 @@ EOF
 HEALTHCHECK --interval=60s --timeout=15s --start-period=90s --retries=1 \
     CMD python3 /usr/local/bin/healthcheck.py
 
-CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--default-max-tokens", "8192", "--max-output-tokens", "16384", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--default-max-tokens", "8192", "--max-output-tokens", "32768", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 
@@ -285,8 +285,8 @@ docker run --restart always --gpus all --ipc=host \
 ```
 
 The Dockerfile bakes in `--max-seq 262208` (256K context), `--default-max-tokens 8192`,
-and `--max-output-tokens 16384`. Clients get 8192 output tokens by default; if a client
-explicitly requests more (up to 16384), the server allows it. Override at the
+and `--max-output-tokens 32768`. Clients get 8192 output tokens by default; if a client
+explicitly requests more (up to 32768), the server allows it. Override at the
 `docker run` command line if needed.
 
 | Flag | Purpose |
@@ -414,7 +414,7 @@ The container defaults to K=4 (best for tool-call agent workloads per FlashRT be
 | Limitation | Details |
 |------------|---------|
 | Greedy decode only | No temperature/top_p/top_k. Speculative decode verify uses argmax. The server accepts but ignores sampling params. |
-| Tool call truncation | Fixed: `--default-max-tokens 8192` now baked into Dockerfile CMD. Previously defaulted to 2048, causing truncated outputs. Hard cap is `--max-output-tokens 16384`. |
+| Tool call truncation | Fixed: `--default-max-tokens 8192` now baked into Dockerfile CMD. Previously defaulted to 2048, causing truncated outputs. Hard cap is `--max-output-tokens 32768`. |
 | Single tool call per turn | Server stops generation on first complete tool call. Multiple tool calls in one response not captured. |
 | NVFP4 hardcoded | Engine uses `quant="nvfp4"`. Switching to FP8 requires engine + kernel changes. |
 | Thinking mode disabled | `enable_thinking` defaults to false. Enabling it may improve tool selection accuracy at cost of more tokens. |

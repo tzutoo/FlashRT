@@ -30,6 +30,12 @@ def build_app(service: AgentService):
 
     @app.get("/v1/models")
     async def list_models():
+        """Return model metadata including capabilities for client discovery.
+
+        OpenAI-compatible clients (e.g. Hermes, Open WebUI) use this endpoint
+        to discover context_length and max_output_tokens. Without it, clients
+        fall back to hardcoded defaults that may not match the actual model.
+        """
         return {
             "object": "list",
             "data": [{
@@ -37,6 +43,8 @@ def build_app(service: AgentService):
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "flash-rt",
+                "context_length": service.engine.max_seq,
+                "max_output_tokens": service.max_output_tokens,
             }],
         }
 
@@ -123,7 +131,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                capsule_budget_bytes: int = 0,
                                default_k: int = 4,
                                default_max_tokens: int = 2048,
-                               max_output_tokens: int = 8192,
+                               max_output_tokens: int = 32768,
                                default_session_id: str | None = None):
     if graph_cache_max is None:
         graph_cache_max = _auto_graph_cache_max(max_seq)
@@ -317,9 +325,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Generated-token budget used when an OpenAI request omits both "
              "max_tokens and max_completion_tokens.")
     parser.add_argument(
-        "--max-output-tokens", type=int, default=8192,
+        "--max-output-tokens", type=int, default=32768,
         help="Hard server-side generated-token cap. Requests above this cap "
-             "return HTTP 400 instead of being silently truncated.")
+             "are clamped to this value (not rejected). Default 32768 matches "
+             "the model's max output capability.")
     parser.add_argument(
         "--default-session-id", default=None,
         help="Legacy fallback session id for older single-client local demos. "

@@ -633,7 +633,8 @@ def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
     assert "data: [DONE]" in text
 
 
-def test_qwen36_agent_fastapi_rejects_output_above_service_cap():
+def test_qwen36_agent_fastapi_clamps_output_above_service_cap():
+    """Requests with max_tokens above the server cap are clamped, not rejected."""
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     from serving.qwen36_agent.server import build_app
@@ -642,13 +643,14 @@ def test_qwen36_agent_fastapi_rejects_output_above_service_cap():
         FakeAgentEngine(), default_max_tokens=4, max_output_tokens=8))
     client = TestClient(app)
 
+    # max_tokens=9 is above the cap of 8 — should be clamped to 8, not rejected
     resp = client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "abc"}],
         "max_tokens": 9,
     })
 
-    assert resp.status_code == 400
-    assert "max_tokens must be <= 8" in resp.text
+    assert resp.status_code == 200
+    # The response should succeed (clamped to 8 tokens)
 
 
 def test_qwen36_agent_fastapi_rejects_full_prompt_before_streaming():
@@ -791,11 +793,12 @@ def test_openai_request_uses_configured_default_and_output_cap():
     }, default_max_tokens=123, max_output_tokens=256)
     assert req.max_tokens == 77
 
-    with pytest.raises(ValueError, match="max_tokens must be <= 256"):
-        request_from_openai({
-            "messages": [{"role": "user", "content": "a"}],
-            "max_tokens": 257,
-        }, default_max_tokens=123, max_output_tokens=256)
+    # max_tokens above cap is clamped, not rejected
+    req = request_from_openai({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_tokens": 257,
+    }, default_max_tokens=123, max_output_tokens=256)
+    assert req.max_tokens == 256  # clamped to cap
 
 
 class FakeTokenizer:

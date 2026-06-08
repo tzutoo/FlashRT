@@ -64,7 +64,7 @@ class AgentService:
                  capsule_budget_bytes: int = 0,
                  default_k: int = 4,
                  default_max_tokens: int = 2048,
-                 max_output_tokens: int = 8192,
+                 max_output_tokens: int = 32768,
                  default_session_id: Optional[str] = None):
         if default_k < 1:
             raise ValueError("default_k must be >= 1")
@@ -917,7 +917,7 @@ def parse_pin_prefix(value: Any) -> Optional[int]:
 
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 4,
                         default_max_tokens: int = 2048,
-                        max_output_tokens: Optional[int] = 8192
+                        max_output_tokens: Optional[int] = 32768
                         ) -> AgentRequest:
     if default_max_tokens < 1:
         raise ValueError("default_max_tokens must be >= 1")
@@ -941,8 +941,10 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 4,
     if max_tokens < 1:
         raise ValueError("max_tokens must be >= 1")
     if max_output_tokens is not None and max_tokens > int(max_output_tokens):
-        raise ValueError(
-            f"max_tokens must be <= {int(max_output_tokens)}")
+        log.warning(
+            "clamping max_tokens from %d to %d (server limit)",
+            max_tokens, int(max_output_tokens))
+        max_tokens = int(max_output_tokens)
     K = parse_int(req.get("flashrt_K"), name="flashrt_K", default=default_k)
     if K < 1:
         raise ValueError("flashrt_K must be >= 1")
