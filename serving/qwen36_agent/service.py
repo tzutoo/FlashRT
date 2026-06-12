@@ -136,8 +136,12 @@ class AgentService:
                 try:
                     for sse_chunk in self._stream_openai(
                             req, model=model, cancel=cancel):
+                        if cancel.is_set():
+                            break
                         sse_queue.put(sse_chunk)
-                    committed = True
+                    else:
+                        # Loop finished normally (no cancel/break)
+                        committed = True
                 finally:
                     cancel.set()
                     if not committed and not self._active_stream_committed:
@@ -160,9 +164,11 @@ class AgentService:
                 yield item
         except GeneratorExit:
             # Client disconnected — signal cancel so the GPU thread
-            # stops within one decode cycle (~100ms), then release
-            # the lock.
+            # stops within one decode cycle (~100ms), then wait for
+            # it to finish so the session cleanup in the finally block
+            # runs before we return.
             cancel.set()
+            gen_thread.join(timeout=5.0)
             raise
 
     def _effective_plan(
@@ -760,13 +766,17 @@ class AgentService:
                 yield sse_data(event_chunk(completion_id, model, ev))
         t_done = time.perf_counter()
 
-        session.commit([*engine_prompt_tokens, *generated_ids])
-        visible_messages = self._copy_messages(req.messages)
-        visible_messages.append(self._assistant_message(
-            "".join(visible_parts), tool_calls))
-        session.visible_messages = visible_messages
-        self._mark_reusable(session, state_lookahead)
-        self._active_stream_committed = True
+        # If cancelled (client disconnect), skip commit — the GPU state
+        # advanced past the journal, so the session must NOT be marked hot.
+        cancelled = cancel is not None and cancel.is_set()
+        if not cancelled:
+            session.commit([*engine_prompt_tokens, *generated_ids])
+            visible_messages = self._copy_messages(req.messages)
+            visible_messages.append(self._assistant_message(
+                "".join(visible_parts), tool_calls))
+            session.visible_messages = visible_messages
+            self._mark_reusable(session, state_lookahead)
+            self._active_stream_committed = True
         usage = {
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(generated_ids),

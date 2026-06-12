@@ -141,7 +141,7 @@ class FakeAgentEngine:
     def prefill(self, token_ids, *, cached_tokens=0, max_tokens=1, K=6):
         self.prefills.append((list(token_ids), cached_tokens, max_tokens, K))
 
-    def generate_stream(self, *, max_tokens, K):
+    def generate_stream(self, *, max_tokens, K, cancel=None):
         self.generate_calls.append((max_tokens, K))
         yield from self.outputs[:max_tokens]
 
@@ -1259,9 +1259,27 @@ def test_agent_service_serializes_concurrent_requests():
 
 def test_stream_disconnect_clears_hot_session():
     """A client disconnect closes the stream generator before the final commit;
-    the GPU state advanced, so the hot session must be cleared (force rebuild)."""
-    svc = AgentService(FakeAgentEngine())
-    svc.sessions.hot_session_id = "stale-prev"   # a hot session from a previous turn     # a hot session from a previous turn
+    the GPU state advanced, so the hot session must be cleared (force rebuild).
+
+    With the threaded SSE queue, the cancel signal propagates to the generate
+    thread which then clears the hot session in its finally block.  We use a
+    blocking engine to guarantee the thread is still mid-decode when the
+    outer generator is closed.
+    """
+    import threading as _threading
+
+    class SlowEngine(FakeAgentEngine):
+        """Yields one chunk then blocks until cancelled."""
+        def generate_stream(self, *, max_tokens, K, cancel=None):
+            self.generate_calls.append((max_tokens, K))
+            yield self.outputs[0]                    # first chunk (prefill done)
+            # Block until cancel is signalled (simulates a long GPU decode)
+            if cancel is not None:
+                cancel.wait(timeout=5.0)
+            # NOT yielded the second chunk — simulates mid-stream disconnect
+
+    svc = AgentService(SlowEngine())
+    svc.sessions.hot_session_id = "stale-prev"   # a hot session from a previous turn
 
     gen = svc.stream_openai(
         AgentRequest(session_id="s",
