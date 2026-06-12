@@ -113,9 +113,48 @@ actions = model.predict(
 )
 ```
 
-State changes update the prompt embeddings. RTX keeps a per-prompt-length
-pipeline cache and updates same-length language buffers in place, so repeated
-state-token lengths do not repeatedly rebuild CUDA Graphs or rerun autotune.
+State changes update the prompt embeddings. Because the discretized state is
+rendered into the prompt, its token length drifts with the state values. The
+RTX Pi0.5 frontend offers two strategies via `state_prompt_mode`:
+
+**`"exact"` (default) — per-length capture + manual warmup.**
+A separate pipeline is captured per exact prompt length and cached, so a
+recurring length is not rebuilt. Front-load the lengths you expect with
+`warm_state_prompt_buckets()` so the control loop does not pay a mid-loop
+capture the first time a new length appears:
+
+```python
+model = flash_rt.load_model(
+    checkpoint="/path/to/pi05", framework="torch", config="pi05")  # exact
+# Pre-warm representative state lengths once at startup:
+warmed = model.warm_state_prompt_buckets(
+    images=[base_img, wrist_img],
+    prompt="pick up the red block",
+    states=[s_min, s_typical, s_max, ...])   # a few representative states
+# control loop: predict() reuses the warmed graphs, no new capture
+```
+
+**`"fixed"` (opt-in) — one graph, no warmup.**
+ONE pipeline and ONE captured CUDA Graph at the max prompt length serve every
+length: the padded prefix keys are masked (FlashAttention-2 `seqused_k`) and the
+decoder's action K/V are appended right after the *valid* prefix
+(`qkv_split_rope_devpos`), so a changing state-token length **never re-captures
+a graph or reruns autotune** — no warmup needed. The trade-off is latency:
+every inference runs at the padded max length, so `"fixed"` is ~+4.6 ms (2
+views) / +6.7 ms (3 views) slower than `"exact"` at a typical prompt length —
+for peak performance prefer `"exact"` and warm a fuller length sweep yourself
+with `warm_state_prompt_buckets()`. (Lowering `PI05_STATE_PROMPT_MAX_LEN`
+toward your real maximum shrinks the padding and the gap.) Enable `"fixed"`
+when you don't want to enumerate state lengths up front:
+
+```python
+model = flash_rt.load_model(
+    checkpoint="/path/to/pi05", framework="torch", config="pi05",
+    state_prompt_mode="fixed")
+# or, without code changes: FLASHRT_PI05_STATE_PROMPT_MODE=fixed
+# predict() handles any state length with a single captured graph
+```
+
 Thor updates same-length prompt embeddings in place after graph capture.
 
 **Q: I'm getting `FileNotFoundError: paligemma_tokenizer.model not found`.**
@@ -185,6 +224,7 @@ model = flash_rt.load_model(
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
 | `cache_frames` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Temporal encoder K/V cache period; `1` means no temporal reuse. |
+| `state_prompt_mode` | `str` | `"exact"` | Pi0.5 torch RTX. State-in-prompt graph strategy: `"exact"` (per-length capture + `warm_state_prompt_buckets()`) or `"fixed"` (one graph at the max length, no recapture; ~+4.6 ms/2v, +6.7 ms/3v). Env override `FLASHRT_PI05_STATE_PROMPT_MODE`. See [Pi0.5 State Prompts](#pi05-state-prompts). |
 
 ### Pi0.5 state prompt bucket warmup
 
