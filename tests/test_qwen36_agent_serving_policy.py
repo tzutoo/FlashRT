@@ -141,7 +141,7 @@ class FakeAgentEngine:
     def prefill(self, token_ids, *, cached_tokens=0, max_tokens=1, K=6):
         self.prefills.append((list(token_ids), cached_tokens, max_tokens, K))
 
-    def generate_stream(self, *, max_tokens, K):
+    def generate_stream(self, *, max_tokens, K, cancel=None):
         self.generate_calls.append((max_tokens, K))
         yield from self.outputs[:max_tokens]
 
@@ -760,7 +760,10 @@ def test_openai_request_and_response_include_flashrt_cache_metrics():
     body = result_to_openai(res, model=engine.model_name)
     assert body["model"] == "fake-qwen36"
     assert body["flashrt"]["session_id"] == "s"
-    assert body["flashrt"]["new_prefill_tokens"] == 2
+    # validate_messages adds default "You are a helpful assistant." system
+    # message when none is present, so prefill includes those 28 tokens + 2
+    # separators + "a" = 31 total.
+    assert body["flashrt"]["new_prefill_tokens"] == 31
     assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
 
 
@@ -1100,6 +1103,24 @@ def test_qwen36_agent_sm120_defaults_disable_exact_position_decode_graphs(monkey
     assert os.environ["FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH"] == "0"
 
 
+def test_qwen36_agent_sm121_defaults_do_not_enable_sm120_fastgemm(monkeypatch):
+    keys = (
+        "FLASHRT_QWEN36_DECODE_FASTGEMM",
+        "FLASHRT_QWEN36_VERIFY_WARPSPLIT",
+        "FLASHRT_QWEN36_TQ_VERIFY_GRAPH",
+        "FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH",
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+    Qwen36FrontendAgentEngine._set_agent_runtime_env_defaults((12, 1))
+
+    assert "FLASHRT_QWEN36_DECODE_FASTGEMM" not in os.environ
+    assert "FLASHRT_QWEN36_VERIFY_WARPSPLIT" not in os.environ
+    assert os.environ["FLASHRT_QWEN36_TQ_VERIFY_GRAPH"] == "0"
+    assert os.environ["FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH"] == "0"
+
+
 def test_qwen36_agent_runtime_defaults_respect_overrides(monkeypatch):
     monkeypatch.setenv("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "1")
     monkeypatch.setenv("FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH", "1")
@@ -1259,9 +1280,27 @@ def test_agent_service_serializes_concurrent_requests():
 
 def test_stream_disconnect_clears_hot_session():
     """A client disconnect closes the stream generator before the final commit;
-    the GPU state advanced, so the hot session must be cleared (force rebuild)."""
-    svc = AgentService(FakeAgentEngine())
-    svc.sessions.hot_session_id = "stale-prev"   # a hot session from a previous turn     # a hot session from a previous turn
+    the GPU state advanced, so the hot session must be cleared (force rebuild).
+
+    With the threaded SSE queue, the cancel signal propagates to the generate
+    thread which then clears the hot session in its finally block.  We use a
+    blocking engine to guarantee the thread is still mid-decode when the
+    outer generator is closed.
+    """
+    import threading as _threading
+
+    class SlowEngine(FakeAgentEngine):
+        """Yields one chunk then blocks until cancelled."""
+        def generate_stream(self, *, max_tokens, K, cancel=None):
+            self.generate_calls.append((max_tokens, K))
+            yield self.outputs[0]                    # first chunk (prefill done)
+            # Block until cancel is signalled (simulates a long GPU decode)
+            if cancel is not None:
+                cancel.wait(timeout=5.0)
+            # NOT yielded the second chunk — simulates mid-stream disconnect
+
+    svc = AgentService(SlowEngine())
+    svc.sessions.hot_session_id = "stale-prev"   # a hot session from a previous turn
 
     gen = svc.stream_openai(
         AgentRequest(session_id="s",

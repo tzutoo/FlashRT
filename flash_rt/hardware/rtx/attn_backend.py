@@ -269,6 +269,18 @@ class RtxFlashAttnBackend:
         # pay zero overhead.
         self.dec_O_masked = torch.empty(chunk_size, 8, 256, dtype=bf16, device=d)
 
+        # ── Fixed-shape (seqused/devpos) state-prompt support ──
+        # One captured graph at the MAX prefix length serves any prompt length.
+        # The valid prefix length is read from device buffers at replay, so FA2
+        # (seqused_k) masks the padded keys and the decoder appends its action
+        # K/V right after the valid prefix (qkv_split_rope_devpos). Updated per
+        # set_prompt via :meth:`set_fixed_valid_len` — runtime inputs, never a
+        # recapture. batch=1, so each is a single int32.
+        self._fixed_shape = False
+        self.enc_seqused = torch.zeros(1, dtype=torch.int32, device=d)  # vis_enc+plen
+        self.dec_seqused = torch.zeros(1, dtype=torch.int32, device=d)  # +chunk
+        self.dec_devpos = torch.zeros(1, dtype=torch.int32, device=d)   # = enc_seqused
+
         # Cached shape metadata
         self._num_views = num_views
         self._encoder_seq_max = encoder_seq_max
@@ -466,6 +478,119 @@ class RtxFlashAttnBackend:
             stream=stream,
         )
 
+    def set_fixed_shape(self, enabled: bool) -> None:
+        """Enable/disable fixed-shape (seqused/devpos) state-prompt execution.
+
+        Fixed shape masks the padded prompt prefix with FlashAttention-2
+        ``seqused_k`` (``fwd_bf16_seqused``) on the encoder + decoder sites, so
+        it is ONLY correct on the vendored bf16 FA2 path with those sites
+        enabled. The legacy pip-flash-attn fallback (``FVK_RTX_FA2=0`` or a
+        site excluded via ``FVK_RTX_FA2_SITES``) does NOT mask the padded keys
+        and would silently produce wrong output — so refuse to enable there
+        instead of falling back. Call with ``False`` to return to per-length
+        execution (the shared backend is reused across pipelines, so the active
+        pipeline must sync this each time it changes).
+        """
+        if enabled:
+            reasons = []
+            if self._is_fp16:
+                reasons.append("backend is fp16 (seqused path is bf16-only)")
+            if not self._use_fvk_fa2:
+                reasons.append("FVK_RTX_FA2=0 (vendored FA2 disabled)")
+            if not self._fa2_sites.get("encoder", False):
+                reasons.append("encoder excluded from FVK_RTX_FA2_SITES")
+            if not self._fa2_sites.get("decoder", False):
+                reasons.append("decoder excluded from FVK_RTX_FA2_SITES")
+            if not hasattr(getattr(self, "_fa2", None), "fwd_bf16_seqused"):
+                reasons.append("flash_rt_fa2.fwd_bf16_seqused unavailable")
+            if not hasattr(getattr(self, "_fa2", None),
+                           "fwd_bf16_seqused_splitkv"):
+                reasons.append("flash_rt_fa2.fwd_bf16_seqused_splitkv "
+                               "unavailable (rebuild flash_rt_fa2)")
+            if reasons:
+                raise RuntimeError(
+                    "Pi0.5 fixed-shape state-prompt mode needs the vendored "
+                    "bf16 FlashAttention-2 seqused path on the encoder+decoder "
+                    "sites; refusing because: " + "; ".join(reasons) + ". Use "
+                    "state_prompt_mode='exact' (per-length capture), or enable "
+                    "FA2 (unset FVK_RTX_FA2 / FVK_RTX_FA2_SITES).")
+        self._fixed_shape = bool(enabled)
+
+    def set_fixed_valid_len(self, valid_prefix_len: int) -> None:
+        """Update the fixed-shape valid prefix length (host->device).
+
+        ``valid_prefix_len`` = vision tokens + valid prompt tokens. Drives:
+          - encoder self-attn seqused_k  = valid_prefix_len
+          - decoder cross-attn seqused_k = valid_prefix_len + chunk
+          - decoder K/V append row offset (devpos) = valid_prefix_len
+        Called once per prompt (outside the captured graph); the graph reads
+        these device buffers at replay, so no recapture as the length drifts.
+        """
+        import torch
+        v = int(valid_prefix_len)
+        self.enc_seqused.fill_(v)
+        self.dec_seqused.fill_(v + self._chunk_size)
+        self.dec_devpos.fill_(v)
+        # Cold path (once per prompt): make the device writes visible before
+        # the next graph replay reads them (the fills run on the current stream,
+        # the graph replays on its own captured stream).
+        torch.cuda.synchronize()
+
+    def _call_fvk_fa2_seqused(self, q, k, v, o, lse, seqused, *,
+                              stream: int = 0, softmax_scale=None):
+        """FA2 with a device-side valid K length (``seqused_k``): the kernel
+        early-exits past ``seqused[0]`` keys, so one fixed-shape (max-length)
+        launch masks the padded prefix bit-exactly. bf16-only."""
+        B, Sq, Hq, D = q.shape
+        Sk, Hk = k.shape[1], k.shape[2]
+        if softmax_scale is None:
+            softmax_scale = 1.0 / (D ** 0.5)
+        self._fa2.fwd_bf16_seqused(
+            Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
+            O=o.data_ptr(), softmax_lse=lse.data_ptr(),
+            seqused_k=seqused.data_ptr(),
+            batch=B, seqlen_q=Sq, seqlen_k=Sk,
+            num_heads_q=Hq, num_heads_kv=Hk, head_dim=D,
+            q_strides=(q.stride(0), q.stride(1), q.stride(2)),
+            k_strides=(k.stride(0), k.stride(1), k.stride(2)),
+            v_strides=(v.stride(0), v.stride(1), v.stride(2)),
+            o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+            softmax_scale=softmax_scale, num_sms=self._num_sms, stream=stream)
+
+    def _call_fvk_fa2_seqused_splitkv(self, q, k, v, o, lse, seqused, *,
+                                      lse_accum, o_accum,
+                                      stream: int = 0, softmax_scale=None):
+        """``fwd_bf16_seqused`` + split-KV (better SM occupancy on tiny-Q,
+        long-K shapes like the Pi0.5 decoder joint-attention: Sq=chunk,
+        Sk=valid_prefix+chunk, 1 KV head).
+
+        ``num_splits`` is computed host-side from ``seqlen_k`` (the K-tensor's
+        max length, fixed at capture) so it is constant across graph replays.
+        At replay with a smaller ``seqused``, splits whose K-range lies entirely
+        past ``seqused`` are empty and the kernel does NOT write ``-inf`` into
+        their ``lse_accum`` slot — so we MUST pre-fill ``lse_accum`` with
+        ``-inf`` each call (captured in the graph). Empty splits then keep
+        ``-inf`` → combine weight ``exp(-inf)=0`` → correct. ``o_accum`` needs
+        no init (it is multiplied by the zero weight). bf16-only."""
+        B, Sq, Hq, D = q.shape
+        Sk, Hk = k.shape[1], k.shape[2]
+        if softmax_scale is None:
+            softmax_scale = 1.0 / (D ** 0.5)
+        lse_accum.fill_(float("-inf"))
+        self._fa2.fwd_bf16_seqused_splitkv(
+            Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
+            O=o.data_ptr(), softmax_lse=lse.data_ptr(),
+            seqused_k=seqused.data_ptr(),
+            softmax_lse_accum=lse_accum.data_ptr(),
+            o_accum=o_accum.data_ptr(),
+            batch=B, seqlen_q=Sq, seqlen_k=Sk,
+            num_heads_q=Hq, num_heads_kv=Hk, head_dim=D,
+            q_strides=(q.stride(0), q.stride(1), q.stride(2)),
+            k_strides=(k.stride(0), k.stride(1), k.stride(2)),
+            v_strides=(v.stride(0), v.stride(1), v.stride(2)),
+            o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+            softmax_scale=softmax_scale, num_sms=self._num_sms, stream=stream)
+
     def vision_attn(self, stream: int = 0) -> int:
         # (batch=nv, seq=256, heads=16, head_dim=72) → per-view attention
         if self._fa2_sites["siglip"]:
@@ -492,9 +617,14 @@ class RtxFlashAttnBackend:
         v = self.enc_V[layer_idx, :seq].unsqueeze(0)     # (1, seq, 1, 256)
         if self._fa2_sites["encoder"]:
             o = self._enc_O[:, :seq].contiguous()
-            self._call_fvk_fa2(q, k, v, o, self._enc_lse, stream=stream,
-                               lse_accum=self._enc_lse_accum,
-                               o_accum=self._enc_o_accum)
+            if self._fixed_shape:
+                # Fixed max shape; padded prefix keys masked via seqused_k.
+                self._call_fvk_fa2_seqused(
+                    q, k, v, o, self._enc_lse, self.enc_seqused, stream=stream)
+            else:
+                self._call_fvk_fa2(q, k, v, o, self._enc_lse, stream=stream,
+                                   lse_accum=self._enc_lse_accum,
+                                   o_accum=self._enc_o_accum)
             return o.data_ptr()
         out = self._flash_attn_func(q, k, v, causal=False)
         self._enc_out_ref = out
@@ -508,9 +638,22 @@ class RtxFlashAttnBackend:
         v = self.enc_V[layer_idx, :total_kv].unsqueeze(0)    # (1, total, 1, 256)
         if self._fa2_sites["decoder"]:
             o = self._dec_O[:, :dec_seq].contiguous()
-            self._call_fvk_fa2(q, k, v, o, self._dec_lse, stream=stream,
-                               lse_accum=self._dec_lse_accum,
-                               o_accum=self._dec_o_accum)
+            if self._fixed_shape:
+                # The decoder's action K/V were appended right after the valid
+                # prefix (qkv_split_rope_devpos), so [0 : valid+chunk] is one
+                # contiguous valid range — single seqused call masks padding.
+                # Split-KV: this shape (Sq=chunk, Sk≈valid+chunk, 1 KV head) is
+                # occupancy-bound; no-split leaves most SMs idle. Split-KV is 3×
+                # faster here. (Encoder stays no-split: its Sq is already large
+                # enough to fill the GPU, and split-KV slightly hurts it.)
+                self._call_fvk_fa2_seqused_splitkv(
+                    q, k, v, o, self._dec_lse, self.dec_seqused,
+                    lse_accum=self._dec_lse_accum, o_accum=self._dec_o_accum,
+                    stream=stream)
+            else:
+                self._call_fvk_fa2(q, k, v, o, self._dec_lse, stream=stream,
+                                   lse_accum=self._dec_lse_accum,
+                                   o_accum=self._dec_o_accum)
             return o.data_ptr()
         out = self._flash_attn_func(q, k, v, causal=False)
         self._dec_out_ref = out

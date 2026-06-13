@@ -480,8 +480,24 @@ class Pi05TorchFrontendRtx:
                  cache_frames: int = 1,
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
-                 fp8_layout: Optional[str] = None):
+                 fp8_layout: Optional[str] = None,
+                 state_prompt_mode: str = "exact"):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # State-in-prompt graph strategy (Pi0.5 renders robot state into the
+        # prompt, so its token length drifts with the state values):
+        #   "exact" (default): a separate pipeline captured per exact length,
+        #       cached; pair with warm_state_prompt_buckets() to front-load the
+        #       lengths you expect so the control loop avoids a mid-loop capture.
+        #   "fixed": ONE pipeline + ONE captured graph at the max prompt length;
+        #       every length is served by masking the padded prefix (FA2
+        #       seqused) + appending decoder K/V at the valid offset (devpos),
+        #       so a changing length never re-captures and no warmup is needed.
+        # Env override: FLASHRT_PI05_STATE_PROMPT_MODE.
+        _spm = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE", state_prompt_mode)
+        if _spm not in ("fixed", "exact"):
+            raise ValueError(
+                f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
+        self._state_prompt_mode = _spm
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
@@ -517,6 +533,10 @@ class Pi05TorchFrontendRtx:
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
         self._prompt_pipeline_cache: dict[int, Pi05Pipeline] = {}
+        # Fixed-shape (state_prompt_mode="fixed") pipeline, cached separately so
+        # switching to a no-state prompt and back reuses the already-calibrated,
+        # already-captured graph instead of rebuilding it.
+        self._fixed_pipeline: Optional[Pi05Pipeline] = None
         # RL inference configuration. ``None`` = default behaviour (single
         # forward, no advantage-conditioned prompt injection). When set
         # by :meth:`set_rl_mode`, the next :meth:`set_prompt` call builds
@@ -639,6 +659,7 @@ class Pi05TorchFrontendRtx:
             chunk_size=self.chunk_size,
             num_encoder_layers=ENC_L)
         self._prompt_pipeline_cache.clear()
+        self._fixed_pipeline = None
         self.pipeline = None
         self.current_prompt_len = 0
         self.graph_recorded = False
@@ -997,12 +1018,84 @@ class Pi05TorchFrontendRtx:
                 raise ValueError(
                     "Pi0.5 RL CFG mode does not support state-in-prompt yet")
             self._set_prompt_rl(prompt_text)
+            # RL has no state-in-prompt; ensure the shared backend is not stuck
+            # in fixed-shape mode from a prior state prompt.
+            self.attn_backend.set_fixed_shape(
+                bool(getattr(self.pipeline, "_fixed_shape", False)))
             return
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
         embeds, prompt_len = _embed_prompt(
             prompt_text, self.embedding_weight, max_len=max_len, state=state)
+
+        if self._state_prompt_mode == "fixed" and state is not None:
+            self._set_prompt_fixed(prompt_len)
+        else:
+            self._set_prompt_per_length(state, prompt_len)
+
+        # The attention backend is shared across pipelines, so sync its
+        # fixed-shape mode to the now-active pipeline BEFORE running it. Without
+        # this, a frontend that ran a fixed state prompt and then a no-state
+        # prompt (which falls back to a per-length pipeline) would keep the
+        # backend in fixed mode and reuse stale seqused/devpos buffers.
+        self.attn_backend.set_fixed_shape(
+            bool(getattr(self.pipeline, "_fixed_shape", False)))
+
+        # Upload language embeds into pipeline's encoder_x slot. In fixed mode
+        # set_language_embeds pads to max + updates the seqused/devpos buffers.
+        embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
+        self.pipeline.set_language_embeds(embeds_np)
+        self._frame_count = 0
+        logger.info("Set prompt: '%s' (%d tokens, state=%s, mode=%s)",
+                    prompt_text, prompt_len, state is not None,
+                    self._state_prompt_mode)
+
+    def _set_prompt_fixed(self, prompt_len: int) -> None:
+        """Fixed-shape mode: build ONE max-length pipeline + one graph; later
+        prompt lengths only update embeds + seqused/devpos (no re-capture).
+
+        The fixed pipeline is cached in ``self._fixed_pipeline`` so that
+        switching to a no-state prompt (which activates a per-length pipeline)
+        and back REUSES the already-calibrated, already-captured graph instead
+        of rebuilding it — a rebuild would re-run FP8 calibration/autotune on a
+        backend the per-length pipeline has since touched (observed CUDA illegal
+        access) and would also perturb numerics via autotune variance.
+        """
+        self._ensure_prompt_capacity(PI05_STATE_PROMPT_MAX_LEN)
+        if self._fixed_pipeline is None:
+            logger.info("Building fixed-shape Pi05Pipeline (max_prompt_len=%d)...",
+                        PI05_STATE_PROMPT_MAX_LEN)
+            pipeline_weights = self._build_pipeline_weights()
+            self._fixed_pipeline = Pi05Pipeline(
+                gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
+                weights=pipeline_weights,
+                num_views=self.num_views,
+                max_prompt_len=PI05_STATE_PROMPT_MAX_LEN,
+                chunk_size=self.chunk_size,
+                num_steps=self._num_steps,
+                vision_pool_factor=self._vision_pool_factor,
+                vision_num_layers=self._vision_num_layers,
+                fixed_shape=True,
+                **self._pipeline_precision_kwargs())
+            if self._fixed_pipeline.use_int8_vision_static:
+                self._fixed_pipeline.vis_int8_static_calibrated = False
+                self._fixed_pipeline.vis_int8_static_scales = {}
+        # (Re)activate the cached fixed pipeline, restoring calibration/capture
+        # state from the instance (mirrors the per-length cache reuse path) so
+        # predict() does not re-calibrate or re-capture on switch-back.
+        if self.pipeline is not self._fixed_pipeline:
+            self.pipeline = self._fixed_pipeline
+            self.graph_recorded = (
+                getattr(self._fixed_pipeline, "_graph", None) is not None)
+            self.calibrated = (
+                self.graph_recorded
+                or bool(getattr(self._fixed_pipeline, "fp8_calibrated", False)))
+        self.current_prompt_len = prompt_len
+
+    def _set_prompt_per_length(self, state, prompt_len: int) -> None:
+        """Legacy 'exact' mode: a separate pipeline captured per exact length
+        (cached so a recurring length is not re-built)."""
         required_capacity = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                              else prompt_len)
         self._ensure_prompt_capacity(required_capacity)
@@ -1021,10 +1114,6 @@ class Pi05TorchFrontendRtx:
             else:
                 logger.info("Building Pi05Pipeline for prompt_len=%d...",
                             prompt_len)
-                # Rebuild the pipeline with the exact prompt length to avoid
-                # wasted compute on padding tokens. The instance is cached so
-                # Pi0.5 discrete-state prompt lengths do not repeatedly pay
-                # build/autotune/capture when they recur.
                 self.graph_recorded = False
                 self.calibrated = False
 
@@ -1041,17 +1130,9 @@ class Pi05TorchFrontendRtx:
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
-                # Reset so calibrate_single_frame collects fresh scales.
                 if self.pipeline.use_int8_vision_static:
                     self.pipeline.vis_int8_static_calibrated = False
                     self.pipeline.vis_int8_static_scales = {}
-
-        # Upload language embeds into pipeline's encoder_x slot
-        embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
-        self.pipeline.set_language_embeds(embeds_np)
-        self._frame_count = 0
-        logger.info("Set prompt: '%s' (%d tokens, state=%s)",
-                    prompt_text, prompt_len, state is not None)
 
     def warm_state_prompt_buckets(self, prompt_text: str, states,
                                   sample_observation: dict) -> list[int]:
@@ -1618,6 +1699,11 @@ class Pi05TorchFrontendRtx:
                 encoder_seq_max=enc_seq_max,
                 chunk_size=self.chunk_size,
                 num_encoder_layers=ENC_L)
+            # Replacing the backend orphans any single-sample pipelines that were
+            # bound to the old one; drop the caches so they are rebuilt on the
+            # new backend (mirrors _ensure_prompt_capacity()).
+            self._prompt_pipeline_cache.clear()
+            self._fixed_pipeline = None
         self._batched_active = True
         # Force pipeline rebuild so set_prompt_batch picks the batched class.
         if not isinstance(self.pipeline, Pi05BatchedPipeline):

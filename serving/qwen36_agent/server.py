@@ -131,7 +131,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                capsule_budget_bytes: int = 0,
                                default_k: int = 4,
                                default_max_tokens: int = 2048,
-                               max_output_tokens: int = 32768,
+                               max_output_tokens: int = 65536,
                                default_session_id: str | None = None):
     if graph_cache_max is None:
         graph_cache_max = _auto_graph_cache_max(max_seq)
@@ -325,9 +325,9 @@ def main(argv: list[str] | None = None) -> None:
         help="Generated-token budget used when an OpenAI request omits both "
              "max_tokens and max_completion_tokens.")
     parser.add_argument(
-        "--max-output-tokens", type=int, default=32768,
+        "--max-output-tokens", type=int, default=65536,
         help="Hard server-side generated-token cap. Requests above this cap "
-             "are clamped to this value (not rejected). Default 32768 matches "
+             "are clamped to this value (not rejected). Default 65536 matches "
              "the model's max output capability.")
     parser.add_argument(
         "--default-session-id", default=None,

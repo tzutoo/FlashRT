@@ -64,7 +64,7 @@ class AgentService:
                  capsule_budget_bytes: int = 0,
                  default_k: int = 4,
                  default_max_tokens: int = 2048,
-                 max_output_tokens: int = 32768,
+                 max_output_tokens: int = 65536,
                  default_session_id: Optional[str] = None):
         if default_k < 1:
             raise ValueError("default_k must be >= 1")
@@ -126,7 +126,7 @@ class AgentService:
         # queue. SSE yields happen OUTSIDE the lock so client disconnect
         # can abort the outer generator immediately without deadlocking.
         import queue
-        sse_queue: queue.Queue[Optional[str]] = queue.Queue()
+        sse_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=4)
 
         def _generate():
             """Run prefill+decode under the lock, push SSE chunks to queue."""
@@ -136,14 +136,43 @@ class AgentService:
                 try:
                     for sse_chunk in self._stream_openai(
                             req, model=model, cancel=cancel):
-                        sse_queue.put(sse_chunk)
-                    committed = True
+                        if cancel.is_set():
+                            # Client disconnected — stop generating and
+                            # release the lock immediately so the next
+                            # request doesn't block.  The GPU zombie
+                            # finishes in the background; the session is
+                            # force-cleared below.
+                            break
+                        # put() with timeout: if the queue consumer has
+                        # stopped reading (client disconnect), the producer
+                        # will block here.  After several consecutive full-
+                        # queue timeouts, infer the consumer is gone and stop.
+                        full_count = 0
+                        while not cancel.is_set():
+                            try:
+                                sse_queue.put(sse_chunk, timeout=0.5)
+                                break
+                            except queue.Full:
+                                full_count += 1
+                                if full_count >= 5:
+                                    log.warning(
+                                        "queue full for %.1fs with no consumer, "
+                                        "stopping generation",
+                                        full_count * 0.5)
+                                    cancel.set()
+                                    break
+                    else:
+                        # Loop finished normally (no cancel/break)
+                        committed = True
                 finally:
                     cancel.set()
                     if not committed and not self._active_stream_committed:
                         self.sessions.hot_session_id = None
                     self._active_stream_committed = False
-                    sse_queue.put(None)  # sentinel: generation done
+                    try:
+                        sse_queue.put(None, timeout=1.0)
+                    except queue.Full:
+                        pass  # No consumer — skip sentinel
 
         gen_thread = threading.Thread(target=_generate, daemon=True)
         gen_thread.start()
@@ -160,9 +189,12 @@ class AgentService:
                 yield item
         except GeneratorExit:
             # Client disconnected — signal cancel so the GPU thread
-            # stops within one decode cycle (~100ms), then release
-            # the lock.
+            # stops within one decode cycle (~100ms), then wait for
+            # it to finish so the session cleanup in the finally block
+            # runs before we return.
+            log.warning("GeneratorExit: client disconnected, setting cancel")
             cancel.set()
+            gen_thread.join(timeout=5.0)
             raise
 
     def _effective_plan(
@@ -702,25 +734,25 @@ class AgentService:
             fetcher = threading.Thread(target=_fetch_chunk, daemon=True)
             fetcher.start()
             next_t0 = time.perf_counter()
-            fetcher.join(timeout=0.1)
+            # Poll with cancel-aware sleep.  Using cancel.wait() instead
+            # of fetcher.join() avoids GIL-contention: CUDA kernels can
+            # hold the GIL via PyTorch's sync, starving join()'s timeout
+            # check.  cancel.wait() releases the GIL during the sleep so
+            # the fetcher can run.
             while fetcher.is_alive():
-                if cancel is not None and cancel.is_set():
+                if cancel.wait(timeout=0.1):
                     log.warning(
                         "stream cancelled after %d tokens "
                         "(client disconnect?), stopping decode early",
                         len(generated_ids))
-                    # Wait briefly for the GPU op to finish so we don't
-                    # corrupt state, then break out.
-                    fetcher.join(timeout=5.0)
-                    # If still alive, the GPU op is stuck. The healthcheck
-                    # will catch the degraded state and restart.
-                    cancel_was_set = True
+                    # Give the current CUDA op 2s to finish.
+                    fetcher.join(timeout=2.0)
                     break
-                fetcher.join(timeout=0.1)
             else:
-                cancel_was_set = False
+                # fetcher finished naturally
+                pass
 
-            if cancel is not None and cancel.is_set() and cancel_was_set:
+            if cancel.is_set():
                 break
 
             if next_exc[0] is not None:
@@ -760,13 +792,17 @@ class AgentService:
                 yield sse_data(event_chunk(completion_id, model, ev))
         t_done = time.perf_counter()
 
-        session.commit([*engine_prompt_tokens, *generated_ids])
-        visible_messages = self._copy_messages(req.messages)
-        visible_messages.append(self._assistant_message(
-            "".join(visible_parts), tool_calls))
-        session.visible_messages = visible_messages
-        self._mark_reusable(session, state_lookahead)
-        self._active_stream_committed = True
+        # If cancelled (client disconnect), skip commit — the GPU state
+        # advanced past the journal, so the session must NOT be marked hot.
+        cancelled = cancel is not None and cancel.is_set()
+        if not cancelled:
+            session.commit([*engine_prompt_tokens, *generated_ids])
+            visible_messages = self._copy_messages(req.messages)
+            visible_messages.append(self._assistant_message(
+                "".join(visible_parts), tool_calls))
+            session.visible_messages = visible_messages
+            self._mark_reusable(session, state_lookahead)
+            self._active_stream_committed = True
         usage = {
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(generated_ids),
@@ -917,7 +953,7 @@ def parse_pin_prefix(value: Any) -> Optional[int]:
 
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 4,
                         default_max_tokens: int = 2048,
-                        max_output_tokens: Optional[int] = 32768
+                        max_output_tokens: Optional[int] = 65536
                         ) -> AgentRequest:
     if default_max_tokens < 1:
         raise ValueError("default_max_tokens must be >= 1")

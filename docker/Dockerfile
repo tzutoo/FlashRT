@@ -1,4 +1,4 @@
-# FlashRT — official x86_64 image (RTX 5090 / 4090 / Ampere).
+# FlashRT — official x86_64 image (RTX 5090 / DGX Spark / 4090 / Ampere).
 #
 # Base: NVIDIA NGC PyTorch 25.10 — ships CUDA 13.0, PyTorch 2.9 with
 # SM120 support, cuBLASLt, nvcc 13.0.88, Python 3.12. Same combo
@@ -33,9 +33,9 @@ ARG GPU_ARCH=""
 ARG CUTLASS_REF=v4.4.2
 ARG FA2_HDIMS=""
 ARG FA2_ARCH_NATIVE_ONLY=""
-#   JOBS   cap cmake parallelism (default: nproc).  In WSL2 with
-#          limited RAM, set JOBS=8 to avoid OOM during nvcc.
-ARG JOBS=""
+#   JOBS   cap cmake parallelism (default: 4).  WSL2 with 35 GB RAM
+#          OOMs at $(nproc)=24; JOBS=4 stays under 32 GB peak.
+ARG JOBS="4"
 
 # ── Tiny base utilities (NGC image already has cmake/ninja/git, but
 #    pin in case a future base image drops one of them). ──
@@ -82,7 +82,7 @@ RUN cmake -B build -S . \
         $( [ -n "${GPU_ARCH}" ] && echo "-DGPU_ARCH=${GPU_ARCH}" ) \
         $( [ -n "${FA2_HDIMS}" ] && echo "-DFA2_HDIMS=${FA2_HDIMS}" ) \
         $( [ -n "${FA2_ARCH_NATIVE_ONLY}" ] && echo "-DFA2_ARCH_NATIVE_ONLY=${FA2_ARCH_NATIVE_ONLY}" ) \
- && cmake --build build -j"${JOBS:-$(nproc)}" --target flash_rt_kernels flash_rt_fa2 \
+ && cmake --build build -j"${JOBS:-4}" --target flash_rt_kernels flash_rt_fa2 \
  && rm -rf build/CMakeFiles
 
 # ── Editable install — registers flash_rt with the system Python so
