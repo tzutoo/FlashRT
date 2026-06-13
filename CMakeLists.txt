@@ -1006,13 +1006,23 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
 endif()
 
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
+# The three NVFP4 FFN GEMM files are also compiled by motus_nvfp4_ffn_sm120_obj
+# (inside the MOTUS block). When MOTUS is ON for SM120, use the object library to
+# avoid duplicate symbols. Otherwise compile directly.
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
-  target_sources(flash_rt_kernels PRIVATE
-    $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
-    csrc/quantize/nvfp4_sf_reshape_sm120.cu)
+  if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
+    target_sources(flash_rt_kernels PRIVATE
+      $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
+      $<TARGET_OBJECTS:motus_nvfp4_ffn_sm120_obj>
+      csrc/quantize/nvfp4_sf_reshape_sm120.cu)
+  else()
+    target_sources(flash_rt_kernels PRIVATE
+      $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
+      csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
+      csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
+      csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
+      csrc/quantize/nvfp4_sf_reshape_sm120.cu)
+  endif()
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
 endif()
@@ -1041,7 +1051,6 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:motus_aux_sm120_obj>
     $<TARGET_OBJECTS:motus_fp8_smallm_sm120_obj>
-    $<TARGET_OBJECTS:motus_nvfp4_ffn_sm120_obj>
     $<TARGET_OBJECTS:motus_action_ffn_v6t_sm120_obj>
     $<TARGET_OBJECTS:motus_und_ffn_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE

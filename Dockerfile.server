@@ -7,39 +7,12 @@ WORKDIR /workspace/FlashRT
 
 EXPOSE 8000
 
-# Health check: sends a tiny completion request and checks decode speed.
-# If GPU is corrupted (from accumulated CUDA graph state), the model still
-# returns HTTP 200 but at 3-5 tok/s instead of 80+. This check catches that
-# and Docker's --restart always will restart the container automatically.
-COPY <<'EOF' /usr/local/bin/healthcheck.py
-import urllib.request, json, sys, os, signal
-try:
-    req = urllib.request.Request(
-        'http://localhost:8000/v1/chat/completions',
-        json.dumps({'model': 'qwen36-27b', 'messages': [{'role': 'user', 'content': 'ping'}], 'max_tokens': 5}).encode(),
-        headers={'Content-Type': 'application/json'})
-    resp = urllib.request.urlopen(req, timeout=15)
-    data = json.loads(resp.read())
-    # Only kill on extreme degradation (< 5 tok/s = GPU corruption).
-    # Normal post-large-context variance can dip to 10-20 tok/s on
-    # tiny 5-token outputs — that's fine, not corruption.
-    tok_s = data.get('flashrt', {}).get('decode_tok_per_s', 0)
-    if tok_s > 0 and tok_s < 5:
-        print(f'DEGRADED: {tok_s:.1f} tok/s - GPU corrupt, killing server for restart')
-        os.kill(1, signal.SIGTERM)
-        sys.exit(1)
-except Exception as e:
-    # If the healthcheck itself fails (CUDA error, timeout, etc.),
-    # the server is in a bad state. Kill PID 1 to trigger restart.
-    print(f'HEALTH FAIL: {e} - killing server for restart')
-    try:
-        os.kill(1, signal.SIGTERM)
-    except Exception:
-        pass
-    sys.exit(1)
-EOF
+# Lightweight liveness check: GET /health returns {"status":"ok"} without
+# running GPU inference. If the server process crashes (CUDA error, OOM),
+# Docker's --restart always restarts the container. The previous
+# decode-speed healthcheck was removed because it accumulated KV cache
+# sessions that filled VRAM and caused the restarts it was trying to prevent.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" || exit 1
 
-HEALTHCHECK --interval=60s --timeout=15s --start-period=90s --retries=1 \
-    CMD python3 /usr/local/bin/healthcheck.py
-
-CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "262208", "--default-max-tokens", "8192", "--max-output-tokens", "32768", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "245760", "--route-min-seq", "0", "--default-max-tokens", "8192", "--max-output-tokens", "65536", "--host", "0.0.0.0", "--port", "8000"]

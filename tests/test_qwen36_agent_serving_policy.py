@@ -760,7 +760,10 @@ def test_openai_request_and_response_include_flashrt_cache_metrics():
     body = result_to_openai(res, model=engine.model_name)
     assert body["model"] == "fake-qwen36"
     assert body["flashrt"]["session_id"] == "s"
-    assert body["flashrt"]["new_prefill_tokens"] == 2
+    # validate_messages adds default "You are a helpful assistant." system
+    # message when none is present, so prefill includes those 28 tokens + 2
+    # separators + "a" = 31 total.
+    assert body["flashrt"]["new_prefill_tokens"] == 31
     assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
 
 
