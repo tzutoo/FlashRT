@@ -118,6 +118,31 @@ Note: this contradicts the `BUILD_NOTES.md` context-sweep table (which claims
 on this build (2026-06-18): `--max-seq 245760` measures ~24 tok/s at ≥4K. The
 graph-ON numbers in `BUILD_NOTES.md` (~142 warm) *do* reproduce.
 
+## Graphs ON even at 32768? No — agent positions never repeat (2026-06-18)
+
+A natural follow-up: once `--max-seq 32768` removes the VRAM starvation, do
+graphs ON start helping? **No.** The graph decision depends on whether decode
+*positions repeat*, not on `max_seq`. An agent conversation grows monotonically,
+so every generated token is at a never-visited `cur_pos` → every decode step is
+a cold capture, never a warm replay. Verified with `qwen36_agent_sim.py`, a
+growing-conversation simulation (one session, history appended each turn):
+
+| turn | graphs OFF @32k | graphs ON @32k |
+|---|---|---|
+| 1 | 106 tok/s | 31 tok/s |
+| 2 |  98 tok/s | 24 tok/s |
+| 3 |  87 tok/s | 23 tok/s |
+| 4 |  94 tok/s | 23 tok/s |
+| 5 |  87 tok/s | 21 tok/s |
+
+Graphs ON is 3–4× slower for agent traffic and even degrades slightly over
+turns (cache fills with captures that never replay; eviction adds overhead).
+Graphs OFF is steady ~90 tok/s.
+
+**Conclusion: graphs OFF is correct for pi/agent serving at every `max_seq`.**
+Graphs ON only wins when the *same* prompt re-runs (benchmarks, demos, prompt
+replay) — `qwen36_graph_sweep.py`'s warm column.
+
 ## How to reproduce
 
 ```bash
