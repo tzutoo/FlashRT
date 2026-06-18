@@ -97,29 +97,27 @@ slowdown).
 At `max_seq=32768` the cache is sized for 32K → ~7.5 GB free → decode stays
 ~130 tok/s flat across 1K–28K and short prompts stay fast after long requests.
 
-## CORRECTED: the real sweet spot is `--max-seq 229376` (2026-06-18)
+## CORRECTED AGAIN: default is `--max-seq 131072` (128K) (2026-06-18)
 
-The 32768 conclusion above was too conservative — it throws away the project's
-long-context advantage. A proper multi-sample `max_seq` sweep
-(`qwen36_maxseq_sweep.py`, median of 3 samples per point) shows the VRAM cliff
-is **sharp and right at the top**: only the very last step (229376→245760)
-collapses. Everything up to 229376 keeps full speed **with up to 32K real
-context**, and 229376 gives a **224K context window** (97% of the original 240K):
+The 229376 recommendation below was still too aggressive. On a clean
+re-run it gave ~457 MiB free (not 944) and 34 tok/s at 35K — because **WSL2
+baseline free VRAM drifts** (~450–950 MiB) and `docker rm+run` does not reset
+it. A config sitting right at the cliff edge is fast when drift is favorable
+and collapses when it isn't.
 
-| max_seq | free MiB | 1K | 8K | 16K | 32K |
-|---:|---:|---:|---:|---:|---:|
-| 32768  | 7892 | 125 | 130 | 106 | 120 |
-| 65536  | 6383 | 127 | 127 | 108 | 121 |
-| 98304  | 4904 | 127 | 130 | 108 | 120 |
-| 131072 | 3462 | 127 | 130 | 108 | 118 |
-| 163840 | 2164 | 122 | 125 | 106 | 120 |
-| 196608 |  844 | 122 | 126 | 108 | 120 |
-| **229376** | **944** | **121** | **130** | **107** | **119** |
-| 245760 |  364 | 122 | **27** | **25** | **27** |  ← cliff
+`--max-seq 131072` leaves ~3.5 GB free, which absorbs the drift *and* a long
+growing session. Verified with `qwen36_pi_growth_sim.py` — a continuous session
+grown to 49K context (what starved 229376):
 
-Verified live at `--max-seq 229376`: free VRAM 960 MiB, agent sim 72–110 tok/s,
-**32K-context decode 105 tok/s** (vs 27 at 245760). Graphs stay OFF for serving
-(see the agent-traffic section below).
+| turn | context | decode | free VRAM |
+|---:|---:|---:|---:|
+| 1  | 11K | 89 tok/s | 3083 MiB |
+| 8  | 32K | 84 tok/s | 3083 MiB |
+| 14 | 49K | 79 tok/s | 3083 MiB (unchanged) |
+
+Decode stays ~80 tok/s to 49K and free VRAM holds steady — **no restart
+needed**, even after the long session that made 229376 stuck-slow. 128K context
+is more than any real coding-agent session needs.
 
 ### Why graphs OFF stays correct at every max_seq
 
@@ -140,15 +138,16 @@ The serving README explicitly says the same: "Do not set
 
 ### Recommendation
 
-Run with `--max-seq 229376` — 224K context **and** ~105–130 tok/s at every
-realistic context size. This keeps FlashRT's long-context advantage (the
-project's whole point) without the 245760 starvation cliff. Intermediate
-values (e.g. 196608) trade a little context for more VRAM headroom.
+Run with `--max-seq 131072` — 128K context, ~3.5 GB free VRAM, ~80–90 tok/s
+at contexts up to 49K, **no restart needed** under long pi sessions. This is
+the committed default in `Dockerfile.server`. Larger values (196608/229376)
+trade headroom for context but drift into an unreliable regime on WSL2; smaller
+values (32768) are bulletproof but over-conservative.
 
 ```bash
 docker run ... flashrt-server:5090 \
     python3 -m serving.qwen36_agent.server --checkpoint /nvfp4 \
-    --max-seq 229376 --route-min-seq 0 \
+    --max-seq 131072 --route-min-seq 0 \
     --default-max-tokens 8192 --max-output-tokens 65536 \
     --host 0.0.0.0 --port 8000
 ```
