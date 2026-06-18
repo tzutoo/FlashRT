@@ -555,6 +555,50 @@ class AgentService:
             return remaining
         return max_tokens
 
+    def _reclip_max_tokens_for_engine(
+            self, req: AgentRequest, max_tokens: int,
+            engine_prompt_tokens: Sequence[int]) -> int:
+        """Re-clip the output budget against the ACTUAL engine token count.
+
+        ``_effective_max_tokens`` and ``validate_request_bounds`` clip against
+        ``len(prompt_tokens)`` — the freshly-rendered prompt from ``req.messages``.
+        But the engine is often fed a LONGER token stream on the
+        ``message_append`` / capsule-restore path: the hot session journal can
+        include hidden control tokens (e.g. Qwen3.6 non-thinking ``<think></think>``
+        blocks, tool-call boundaries) that OpenAI-compatible clients never
+        resend. The rendered-prompt clip therefore under-counts, and without
+        this re-clip the prefill hits the ``max_seq`` ceiling mid-stream and
+        raises ``ValueError`` — which for an SSE stream surfaces to the client
+        as a broken response ("Stream ended without finish_reason") instead of
+        a clean error.
+
+        This re-derives the bound from the real engine token length so the
+        engine never overflows; if the journal has grown so large that even one
+        output token won't fit, it raises a clear ``ValueError`` that the HTTP
+        layer maps to a 400 with an actionable message (reduce context / start
+        a new session / raise --max-seq).
+        """
+        from .engine import DecodeChunk  # noqa: F401  (kept for stable import surface)
+        max_seq = int(getattr(self.engine, "max_seq", 0) or 0)
+        if max_seq <= 0:
+            return max_tokens
+        engine_len = len(engine_prompt_tokens)
+        remaining = max_seq - engine_len
+        if remaining < 1:
+            raise ValueError(
+                f"the active conversation is {engine_len} tokens long, which "
+                f"already fills --max-seq {max_seq}; start a new session "
+                "(clear the conversation) or restart the server with a larger "
+                "--max-seq")
+        clipped = min(int(max_tokens), remaining)
+        if clipped < int(max_tokens):
+            log.warning(
+                "re-clipping max_tokens from %d to %d: engine prompt is %d "
+                "tokens (session journal grew past the rendered prompt), "
+                "max_seq=%d",
+                int(max_tokens), clipped, engine_len, max_seq)
+        return clipped
+
     def validate_request_bounds(self, req: AgentRequest) -> None:
         """Fail hard context-limit errors before a StreamingResponse starts.
 
@@ -641,6 +685,13 @@ class AgentService:
             else:
                 effective_cached, plan = self._effective_plan(session, plan)
                 self._log_reuse_miss(session, plan, req.messages)
+            # Re-clip against the ACTUAL engine token count: on the append /
+            # capsule path the journal can be longer than the rendered prompt
+            # (hidden control tokens), so the earlier clip under-counts and the
+            # prefill would overflow max_seq mid-request. Raises a clean
+            # ValueError (-> HTTP 400) if the session has grown too large.
+            max_tokens = self._reclip_max_tokens_for_engine(
+                req, max_tokens, engine_prompt_tokens)
             self.engine.prefill(
                 engine_prompt_tokens,
                 cached_tokens=effective_cached,
@@ -775,6 +826,13 @@ class AgentService:
             else:
                 effective_cached, plan = self._effective_plan(session, plan)
                 self._log_reuse_miss(session, plan, req.messages)
+            # Re-clip against the ACTUAL engine token count: on the append /
+            # capsule path the journal can be longer than the rendered prompt
+            # (hidden control tokens), so the earlier clip under-counts and the
+            # prefill would overflow max_seq mid-request. Raises a clean
+            # ValueError (-> HTTP 400) if the session has grown too large.
+            max_tokens = self._reclip_max_tokens_for_engine(
+                req, max_tokens, engine_prompt_tokens)
             self.engine.prefill(
                 engine_prompt_tokens,
                 cached_tokens=effective_cached,

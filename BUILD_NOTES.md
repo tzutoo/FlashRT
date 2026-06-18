@@ -107,7 +107,7 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" || exit 1
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", \
-     "--max-seq", "131072", "--route-min-seq", "0", \
+     "--max-seq", "196608", "--route-min-seq", "0", \
      "--default-max-tokens", "8192", "--max-output-tokens", "65536", \
      "--host", "0.0.0.0", "--port", "8000"]
 ```
@@ -177,10 +177,10 @@ docker run --restart always --gpus all --ipc=host \
 ```
 
 The Dockerfile bakes in:
-- `--max-seq 131072` (128K context window)
+- `--max-seq 196608` (192K context window)
 - `--route-min-seq 0` (FP8-KV path for all prompts — avoids per-position graph capture)
 - `--default-max-tokens 8192` (default output budget)
-- `--max-output-tokens 65536` (hard cap; input + output share the 128K pool dynamically)
+- `--max-output-tokens 65536` (hard cap; input + output share the 192K pool dynamically)
 
 | Env var | Purpose |
 |---------|---------|
@@ -198,7 +198,7 @@ Startup takes ~10s. Verify:
 
 ```bash
 curl -s http://localhost:8000/v1/models/qwen36-27b
-# {"id":"qwen36-27b","object":"model","owned_by":"flash-rt","context_length":131072,"max_output_tokens":65536}
+# {"id":"qwen36-27b","object":"model","owned_by":"flash-rt","context_length":196608,"max_output_tokens":65536}
 
 curl -s http://localhost:8000/v1/chat/completions \
     -H 'Content-Type: application/json' \
@@ -238,7 +238,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
           "name": "Qwen3.6 27B NVFP4 (local RTX 5090)",
           "tool_call": true,
           "temperature": false,
-          "limit": { "context": 131072, "output": 65536 },
+          "limit": { "context": 196608, "output": 65536 },
           "cost": { "input": 0, "output": 0 }
         }
       }
@@ -259,7 +259,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
 ## Performance
 
 All numbers measured on RTX 5090 (SM120, 32 GB VRAM) in WSL2 Docker,
-`--max-seq 131072`, `--route-min-seq 0`, FP8-KV, speculative decode K=4,
+`--max-seq 196608`, `--route-min-seq 0`, FP8-KV, speculative decode K=4,
 CUDA graph flags off (production default).
 
 | Metric | Value |
@@ -269,7 +269,7 @@ CUDA graph flags off (production default).
 | 64K context decode | **~89 tok/s** |
 | 200K context decode | **~97 tok/s** |
 | Without speculative decode | ~36 tok/s (K=1, no MTP) |
-| Context window | 128K tokens |
+| Context window | 192K tokens |
 | Max output tokens | 65,536 |
 | VRAM usage | ~31.2 GB (leaving ~900 MiB free) |
 
@@ -297,32 +297,39 @@ CUDA graph flags off (production default).
 
 Only new tokens prefilled each turn. TTFT stays flat (~50ms) regardless of context growth.
 
-### Why 131072 (128K) instead of 224K/240K/256K?
+### Why 196608 (192K) instead of 128K / 224K / 256K?
 
-The VRAM headroom — not the max_seq number — is what keeps decode fast, and on
-WSL2 the baseline free VRAM drifts (~450–950 MiB jitter that `docker rm+run`
-does not reset). A config that sits right at the cliff edge is fast when the
-drift is favorable and collapses to ~30 tok/s when it isn't.
+This is a deliberate trade between **context capacity** and **decode-speed
+stability** on a 32 GB card shared with the Windows desktop (WSL2). Real
+pi/coding-agent sessions that paste whole articles or large files routinely
+grow past 95K tokens; at `--max-seq 131072` (128K) those sessions overflowed
+`max_seq` mid-request and the server raised `ValueError` mid-SSE, surfacing to
+pi as a broken `Stream ended without finish_reason`.
 
-`--max-seq 131072` leaves ~3.5 GB idle free, which absorbs both the drift *and*
-a long growing session. Measured with a continuous session grown to 49K context
-(simulating a long pi/coding-agent session, `qwen36_pi_growth_sim.py`):
+`--max-seq 196608` (192K) comfortably fits a 95K session + multi-turn growth +
+the 8192 default output budget, with measured steady-state decode of
+~108–120 tok/s up to 32K real context. It leaves ~1.3 GB idle free VRAM —
+borderline, so under extreme session growth + an unlucky WSL2 free-VRAM drift
+you may see decode slow to ~30 tok/s; a `docker restart` clears it.
 
-| turn | context | decode | free VRAM |
-|---:|---:|---:|---:|
-| 1  | 11K | 89 tok/s | 3083 MiB |
-| 8  | 32K | 84 tok/s | 3083 MiB |
-| 14 | 49K | 79 tok/s | 3083 MiB (unchanged) |
+Two guards make 192K safe to run as the default:
 
-Decode stays ~80 tok/s all the way to 49K and free VRAM holds steady — **no
-restart needed**, even after the kind of long session that starved the
-larger configs. (At 229376, the same 47K session dropped free VRAM 933→252 MiB
-and decode to 18–26 tok/s, stuck slow until a restart.)
+1. **Overflow no longer crashes the stream.** `service._reclip_max_tokens_for_engine`
+   re-clips the output budget against the ACTUAL engine token count (the hot
+   session journal, which can be longer than the client-rendered prompt because
+   of hidden Qwen3.6 control tokens). If a session genuinely fills `max_seq`,
+   the server returns a clean HTTP 400 ("the active conversation is N tokens
+   long, which already fills --max-seq; start a new session") instead of a
+   broken SSE stream.
+2. **`docker stop` releases VRAM deterministically** (see
+   [GPU Memory Not Released on `docker stop`](#gpu-memory-not-released-on-docker-stop)),
+   so recovery from the slow state is a clean ~10 s stop/start, not a
+   `wsl --shutdown`.
 
-Larger values trade headroom for context and drift into the unreliable regime;
-256K (262208) is outright catastrophic. If you need more than 128K context,
-196608 (192K, ~1.3 GB free) is the upper edge — workable but expect to restart
-periodically. See `benchmarks/qwen36_graph_results.md` for the full sweep.
+If your sessions are small (rarely pasting whole files) and you want rock-solid
+decode speed with no restarts, `--max-seq 131072` (128K, ~3.5 GB free) is the
+bulletproof choice. The earlier sweep data is in
+`benchmarks/qwen36_graph_results.md`.
 
 ### Speculative decode K
 

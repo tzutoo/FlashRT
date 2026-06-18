@@ -97,27 +97,37 @@ slowdown).
 At `max_seq=32768` the cache is sized for 32K → ~7.5 GB free → decode stays
 ~130 tok/s flat across 1K–28K and short prompts stay fast after long requests.
 
-## CORRECTED AGAIN: default is `--max-seq 131072` (128K) (2026-06-18)
+## FINAL: default is `--max-seq 196608` (192K) (2026-06-18)
 
-The 229376 recommendation below was still too aggressive. On a clean
-re-run it gave ~457 MiB free (not 944) and 34 tok/s at 35K — because **WSL2
-baseline free VRAM drifts** (~450–950 MiB) and `docker rm+run` does not reset
-it. A config sitting right at the cliff edge is fast when drift is favorable
-and collapses when it isn't.
+The earlier 131072 (128K) recommendation was too conservative for real
+pi/coding-agent traffic that pastes whole articles or large files — those
+sessions routinely hit 95K tokens, and at 128K they overflowed `max_seq`
+mid-request, crashing the SSE stream (`Stream ended without finish_reason`).
 
-`--max-seq 131072` leaves ~3.5 GB free, which absorbs the drift *and* a long
-growing session. Verified with `qwen36_pi_growth_sim.py` — a continuous session
-grown to 49K context (what starved 229376):
+`--max-seq 196608` (192K) fits a 95K session + multi-turn growth + the 8192
+default output budget, with measured steady-state decode ~108–120 tok/s up to
+32K real context. It leaves ~1.3 GB idle free VRAM (borderline on WSL2 — under
+extreme session growth + unlucky free-VRAM drift you may see ~30 tok/s; a
+`docker restart` clears it).
+
+Two guards make 192K safe as the default:
+1. **Overflow no longer crashes the stream** — `service._reclip_max_tokens_for_engine`
+   re-clips the output budget against the actual engine token count (the hot
+   session journal, longer than the rendered prompt because of hidden Qwen3.6
+   control tokens); if a session truly fills `max_seq` it returns a clean HTTP
+   400 instead of a broken SSE stream.
+2. **`docker stop` releases VRAM deterministically** (the `release_gpu()` work),
+   so recovery from the slow state is a ~10 s stop/start.
+
+For sessions that stay small and want bulletproof decode speed with no
+restarts, `--max-seq 131072` (128K, ~3.5 GB free) remains a valid conservative
+choice — verified with `qwen36_pi_growth_sim.py` (49K session, ~80 tok/s, free
+VRAM steady, no restart):
 
 | turn | context | decode | free VRAM |
 |---:|---:|---:|---:|
 | 1  | 11K | 89 tok/s | 3083 MiB |
-| 8  | 32K | 84 tok/s | 3083 MiB |
-| 14 | 49K | 79 tok/s | 3083 MiB (unchanged) |
-
-Decode stays ~80 tok/s to 49K and free VRAM holds steady — **no restart
-needed**, even after the long session that made 229376 stuck-slow. 128K context
-is more than any real coding-agent session needs.
+| 14 | 49K | 79 tok/s | 3083 MiB |
 
 ### Why graphs OFF stays correct at every max_seq
 
@@ -138,16 +148,17 @@ The serving README explicitly says the same: "Do not set
 
 ### Recommendation
 
-Run with `--max-seq 131072` — 128K context, ~3.5 GB free VRAM, ~80–90 tok/s
-at contexts up to 49K, **no restart needed** under long pi sessions. This is
-the committed default in `Dockerfile.server`. Larger values (196608/229376)
-trade headroom for context but drift into an unreliable regime on WSL2; smaller
-values (32768) are bulletproof but over-conservative.
+Run with `--max-seq 196608` (192K) — fits paste-heavy/article sessions (95K+)
+with multi-turn growth, ~108–120 tok/s steady-state, with the overflow-reclip
+fix making the edge case return a clean 400 instead of crashing the stream.
+This is the committed default in `Dockerfile.server`. For small-session
+workloads that prioritize bulletproof decode speed, `--max-seq 131072` (128K,
+~3.5 GB free, no restarts) is the conservative alternative.
 
 ```bash
 docker run ... flashrt-server:5090 \
     python3 -m serving.qwen36_agent.server --checkpoint /nvfp4 \
-    --max-seq 131072 --route-min-seq 0 \
+    --max-seq 196608 --route-min-seq 0 \
     --default-max-tokens 8192 --max-output-tokens 65536 \
     --host 0.0.0.0 --port 8000
 ```
