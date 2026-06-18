@@ -94,6 +94,13 @@ class AgentService:
         # life of the generator (released when it is exhausted or closed).
         self._lock = threading.Lock()
         self._active_stream_committed = False
+        # Shutdown coordination so `docker stop` releases GPU memory every
+        # time. ``_shutdown`` is set by request_shutdown() from the SIGTERM
+        # handler (server._GracefulGpuServer); active stream producers /
+        # consumers poll it. See request_shutdown()/shutdown() and
+        # qwen36_engine.release_gpu().
+        self._shutdown = threading.Event()
+        self._active_streams: List[Dict[str, Any]] = []
 
     def request_from_openai(self, req: Dict[str, Any]) -> AgentRequest:
         agent_req = request_from_openai(
@@ -119,9 +126,59 @@ class AgentService:
                 if not completed:
                     self.sessions.hot_session_id = None
 
+    def request_shutdown(self) -> None:
+        """Non-blocking shutdown request: set the global shutdown flag and cancel
+        every active stream.
+
+        Safe to call from a signal handler (the SIGTERM path in
+        ``server._GracefulGpuServer``) — it only flips ``threading.Event``
+        objects and never blocks, so the asyncio loop is not stalled. The
+        bounded ``join`` of producer threads happens later in :meth:`shutdown`,
+        once uvicorn has stopped draining connections.
+
+        This is what makes ``docker stop`` release GPU memory every time:
+        without it, uvicorn waits for an in-flight 65536-token generation,
+        Docker's 10s stop grace expires, and the process is SIGKILLed
+        mid-CUDA-op — on WSL2/Docker Desktop that orphans dedicated VRAM.
+        """
+        if not self._shutdown.is_set():
+            log.info(
+                "agent service: shutdown requested, cancelling %d active "
+                "stream(s)", len(self._active_streams))
+        self._shutdown.set()
+        for handle in list(self._active_streams):
+            handle["cancel"].set()
+
+    def shutdown(self) -> None:
+        """Block until in-flight producer threads have exited (bounded), so the
+        GPU teardown that follows cannot race a decode kernel.
+
+        Called from the FastAPI lifespan shutdown hook and from ``main``'s
+        finally block. Idempotent: safe to call from both (e.g. on uvicorn
+        ``force_exit`` where the lifespan hook is skipped).
+        """
+        self.request_shutdown()
+        for handle in list(self._active_streams):
+            thread = handle["thread"]
+            if thread.is_alive():
+                thread.join(timeout=3.0)
+        self._active_streams.clear()
+        log.info("agent service: shutdown complete, in-flight streams drained")
+
     def stream_openai(self, req: AgentRequest, *,
-                      model: str) -> Iterable[str]:
-        cancel = threading.Event()
+                      model: str,
+                      cancel: Optional[threading.Event] = None) -> Iterable[str]:
+        # ``cancel`` may be injected by the HTTP layer so it can be flipped the
+        # instant the ASGI layer reports ``http.disconnect`` (see
+        # ``server._await_client_disconnect``). Detecting client abort via
+        # GeneratorExit or a full-queue heuristic is unreliable for SSE:
+        # Starlette's ``aclose()`` cannot interrupt a generator whose
+        # ``next()`` is blocked in a queue get-loop, so without an explicit
+        # disconnect watcher the GPU decode keeps running to ``max_tokens``
+        # after the client (e.g. pi's Esc) vanishes — full GPU util, even
+        # though no one is reading the response.
+        if cancel is None:
+            cancel = threading.Event()
         # Run prefill + decode under the lock, but collect results into a
         # queue. SSE yields happen OUTSIDE the lock so client disconnect
         # can abort the outer generator immediately without deadlocking.
@@ -175,27 +232,52 @@ class AgentService:
                         pass  # No consumer — skip sentinel
 
         gen_thread = threading.Thread(target=_generate, daemon=True)
+        # Register the stream so request_shutdown()/shutdown() (called from
+        # the SIGTERM handler / lifespan hook) can cancel it. Without this,
+        # `docker stop` SIGKILLs the process after its 10s grace while a
+        # 65536-token generation is still running, and on WSL2/Docker Desktop
+        # the CUDA context is torn down mid-op, leaving dedicated GPU memory
+        # unreleased.
+        stream_handle = {"thread": gen_thread, "cancel": cancel}
+        self._active_streams.append(stream_handle)
         gen_thread.start()
         try:
             while True:
+                # Drain the queue first. Checking cancel *before* get would
+                # drop already-produced tail chunks (notably the final
+                # ``[DONE]``) when the producer flips cancel in its own
+                # finally on normal completion. Instead, stop only when the
+                # queue is empty AND the producer has exited or we've been
+                # asked to cancel (client disconnect via the ASGI watcher, or
+                # container shutdown).
                 try:
                     item = sse_queue.get(timeout=0.2)
                 except queue.Empty:
-                    if not gen_thread.is_alive():
+                    if (not gen_thread.is_alive()
+                            or self._shutdown.is_set()
+                            or cancel.is_set()):
                         break
                     continue
                 if item is None:
                     break
                 yield item
-        except GeneratorExit:
-            # Client disconnected — signal cancel so the GPU thread
-            # stops within one decode cycle (~100ms), then wait for
-            # it to finish so the session cleanup in the finally block
-            # runs before we return.
-            log.warning("GeneratorExit: client disconnected, setting cancel")
+        finally:
+            # Runs on normal completion, client disconnect (cancel set by the
+            # ASGI watcher), or container shutdown. We do NOT rely on
+            # GeneratorExit: under Starlette it does not reliably fire for an
+            # SSE generator whose ``next()`` is blocked in a queue get-loop,
+            # so it can't be the primary disconnect signal. Instead always
+            # flip cancel and join the GPU producer (bounded) so the engine
+            # lock is released promptly and the next request is not blocked.
+            # If GeneratorExit / GeneratorExit was thrown in, it propagates
+            # automatically after this block (we never yield here).
             cancel.set()
-            gen_thread.join(timeout=5.0)
-            raise
+            if gen_thread.is_alive():
+                gen_thread.join(timeout=5.0)
+            try:
+                self._active_streams.remove(stream_handle)
+            except ValueError:
+                pass
 
     def _effective_plan(
             self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:

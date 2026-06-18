@@ -118,6 +118,7 @@ CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", \
 |--------|-------|---------|
 | Developer-role normalize | `service.py` | Normalize `developer` → `system`, flatten list-style content blocks |
 | Cancel-on-disconnect | `service.py`, `qwen36_engine.py`, `engine.py` | Stop zombie GPU decode after client disconnect |
+| Deterministic GPU release on `docker stop` | `service.py`, `qwen36_engine.py`, `server.py` | Cancel in-flight streams on SIGTERM and tear the CUDA context down so VRAM is returned to the driver every time (see [GPU Memory Not Released on `docker stop`](#gpu-memory-not-released-on-docker-stop) below) |
 
 #### Developer-role normalize
 
@@ -162,6 +163,7 @@ hf download Qwen/Qwen3.6-27B-FP8 --local-dir ./qwen36_fp8                # ~29 G
 ```bash
 docker run --restart always --gpus all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
+    --stop-timeout 30 \
     -p 8000:8000 -d \
     --name flashrt-qwen36 \
     -v $(pwd)/qwen36_nvfp4:/nvfp4:ro \
@@ -185,6 +187,12 @@ The Dockerfile bakes in:
 | `MTP_CKPT_DIR=/fp8` | MTP head location (speculative decode) |
 | `LONG_KV_CACHE=fp8` | FP8 KV cache for long context |
 | `HF_HUB_OFFLINE=1` | Don't phone home to HuggingFace |
+
+`--stop-timeout 30` gives the SIGTERM-driven GPU teardown (see
+[GPU Memory Not Released on `docker stop`](#gpu-memory-not-released-on-docker-stop))
+ample margin over Docker's default 10 s grace. The teardown itself is bounded to
+~one decode cycle (active streams are cancelled first), so `docker stop`
+normally completes in 1–3 s.
 
 Startup takes ~10s. Verify:
 
@@ -413,6 +421,7 @@ FlashRT/
 | opencode says "Not Found" | Provider must be custom name (not `openai`), must include `npm` |
 | Server unreachable | Container must bind `0.0.0.0`. `baseURL` must include `/v1` |
 | Client gets no response | See [Client Disconnect](#client-disconnect--zombie-process) below |
+| VRAM not freed after `docker stop` | See [GPU Memory Not Released on `docker stop`](#gpu-memory-not-released-on-docker-stop) below |
 
 ---
 
@@ -448,6 +457,73 @@ yields happen *outside* the GPU lock:
 
 This avoids relying on `GeneratorExit` (which Starlette's `StreamingResponse`
 never fires for SSE streams).
+
+---
+
+## GPU Memory Not Released on `docker stop`
+
+### The problem
+
+When a container is stopped, Docker sends `SIGTERM`, waits its grace period
+(10 s default), then `SIGKILL`. FlashRT loads ~31 GB of weights + KV cache as
+CUDA tensors, and a streaming request can generate up to 65 536 tokens (tens of
+seconds). Plain `uvicorn.run()` does *graceful* shutdown: it **waits for
+in-flight requests to finish** before running the ASGI lifespan shutdown. So a
+live generation kept uvicorn alive past the 10 s grace, Docker `SIGKILL`ed the
+process **mid-CUDA-operation**, and on WSL2 / Docker Desktop the `dxgkrnl`
+GPU paravirtualization layer intermittently failed to reclaim the VRAM — the
+"dedicated GPU memory not released" you saw, only fixed by restarting the WSL
+VM or Docker Desktop.
+
+There was also **no explicit CUDA teardown anywhere**: weights, CUDA graphs,
+the graph mempool, and streams were all left for the OS to reclaim.
+
+### The fix
+
+Deterministic, fast shutdown so the process always exits cleanly (never
+`SIGKILL`ed mid-op) and the CUDA context is torn down explicitly:
+
+1. **Cancel in-flight streams on SIGTERM, before uvicorn drains connections.**
+   `main()` runs uvicorn through a `Server` subclass (`_GracefulGpuServer`)
+   whose `SIGTERM`/`SIGINT` handler calls `service.request_shutdown()` — a
+   non-blocking (signal-safe) flip of a `threading.Event` plus one `.set()`
+   per active stream. Streaming consumers poll this every 0.2 s, so every
+   response ends within ~one decode cycle and uvicorn shuts down well inside
+   Docker's grace.
+2. **Join the daemon decode threads.** `service.shutdown()` waits (bounded,
+   ~3 s) for the producer threads to observe `cancel` and exit, so no decode
+   kernel is in flight when the context is torn down.
+3. **Explicit CUDA teardown.** `qwen36_engine.release_gpu()` calls
+   `torch.cuda.synchronize()`, clears the graph caches + mempool, drops the
+   frontend (weights / streams / KV cache / HF pipeline), runs `gc.collect()`
+   + `torch.cuda.ipc_collect()`, then `torch.cuda.empty_cache()` — handing all
+   device memory back to the driver. This runs in the FastAPI **lifespan
+   shutdown** hook, and again in `main()`'s `finally` (covers `force_exit`).
+
+Net effect: `docker stop` completes in ~1–3 s every time and VRAM is returned
+on the spot. Both `shutdown()` and `release_gpu()` are idempotent.
+
+### Verify
+
+```bash
+# Watch VRAM before / during / after stop (Windows host, or nvidia-smi in WSL)
+nvidia-smi --query-gpu=memory.used --format=csv -l 1
+docker stop flashrt-qwen36    # ~1–3 s, then memory drops back to ~0
+```
+
+You should see the `release_gpu: CUDA context torn down` line in
+`docker logs flashrt-qwen36` right before the container exits.
+
+### Operational notes
+
+- `--stop-timeout 30` in `docker run` (shown in [Step 4](#step-4-start-the-server-container))
+  gives margin; the teardown is bounded to ~one decode cycle so it rarely
+  needs it.
+- A second `SIGTERM`/Ctrl-C sets uvicorn `force_exit`, which skips the
+  lifespan hook — the `main()` `finally` block still runs the teardown.
+- If VRAM ever still appears held after stop, `docker ps -a` for a zombie
+  container or check `nvidia-smi`'s process list; a `wsl --shutdown` clears
+  any leftover WSL2 GPU state.
 
 ---
 

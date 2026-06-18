@@ -6,8 +6,10 @@ The HTTP layer is intentionally thin: all cache and streaming policy lives in
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict
 
@@ -22,11 +24,80 @@ SSE_HEADERS = {
 }
 
 
+async def _await_client_disconnect(request, cancel) -> None:
+    """Poll the ASGI layer for ``http.disconnect`` and flip ``cancel``.
+
+    This is the reliable client-abort signal for streaming requests. It runs
+    as an asyncio task alongside ``StreamingResponse`` and uses Starlette's
+    non-blocking ``request.is_disconnected()`` (a ``move_on_after(0)`` peek
+    on the receive channel, safe to call concurrently with the response's own
+    listener). When the client goes away (pi Esc, dropped TCP, crash),
+    ``cancel`` is set within one poll interval (~0.2s); the service's GPU
+    producer observes it between decode chunks and stops, instead of running
+    to ``max_tokens`` at full GPU util.
+    """
+    try:
+        while not cancel.is_set():
+            try:
+                gone = await request.is_disconnected()
+            except Exception:
+                # ASGI channel already closed / runtime error: treat as a
+                # disconnect so we never miss an abort.
+                log.warning(
+                    "disconnect poll raised, cancelling stream", exc_info=True)
+                cancel.set()
+                return
+            if gone:
+                log.info(
+                    "client disconnected (http.disconnect); cancelling GPU "
+                    "stream")
+                cancel.set()
+                return
+            await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        # The stream finished normally and the generator's finally cancelled
+        # us — expected, nothing to do.
+        raise
+
+
 def build_app(service: AgentService):
-    from fastapi import FastAPI, HTTPException
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import StreamingResponse
 
-    app = FastAPI(title="FlashRT Qwen3.6 Agent Serving")
+    # With ``from __future__ import annotations`` (PEP 563) every annotation is
+    # a string, and FastAPI resolves type hints against the *module* globals,
+    # not this function's locals. ``chat_completions`` takes ``request:
+    # Request``; expose the symbol here so FastAPI injects the Starlette
+    # request instead of treating ``request`` as a required query parameter
+    # (422 "Field required"). Keeping the import lazy preserves the property
+    # that this module imports without FastAPI installed.
+    globals()["Request"] = Request
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        # ----- deterministic GPU teardown on shutdown ---------------------
+        # docker stop -> SIGTERM -> uvicorn graceful shutdown -> this hook.
+        # _GracefulGpuServer's SIGTERM handler has already cancelled in-flight
+        # streams, so no decode thread is mid-kernel; finish draining them,
+        # then tear the CUDA context down so the driver reclaims VRAM. Without
+        # this the process is SIGKILLed after Docker's 10s grace (mid-CUDA-op
+        # on WSL2) and dedicated GPU memory can stay "in use" until the WSL
+        # VM / Docker Desktop is restarted.
+        try:
+            service.shutdown()
+        except Exception:
+            log.exception("lifespan shutdown: service.shutdown failed")
+        release = getattr(service.engine, "release_gpu", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                log.exception("lifespan shutdown: engine.release_gpu failed")
+
+    app = FastAPI(title="FlashRT Qwen3.6 Agent Serving", lifespan=lifespan)
 
     @app.get("/v1/models")
     async def list_models():
@@ -67,13 +138,35 @@ def build_app(service: AgentService):
         }
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(raw: Dict[str, Any]):
+    async def chat_completions(raw: Dict[str, Any], request: Request):
         try:
             req = service.request_from_openai(raw)
             if req.stream:
                 service.validate_request_bounds(req)
+                cancel = threading.Event()
+                # Watch the ASGI layer for client disconnect and flip ``cancel``
+                # the instant the TCP connection drops (pi Esc, network loss,
+                # client crash). This is the *reliable* path for cancelling
+                # GPU decode on abort: Starlette does not deliver GeneratorExit
+                # into an SSE generator whose ``next()`` is blocked in a queue
+                # get-loop, so without this watcher the decode keeps running to
+                # ``max_tokens`` at full GPU util after the client is gone.
+                # Detected within one poll interval (~0.2s) of the disconnect.
+                disconnect_task = asyncio.create_task(
+                    _await_client_disconnect(request, cancel))
+
+                def _sse():
+                    try:
+                        yield from service.stream_openai(
+                            req,
+                            model=service.engine.model_name,
+                            cancel=cancel,
+                        )
+                    finally:
+                        disconnect_task.cancel()
+
                 return StreamingResponse(
-                    service.stream_openai(req, model=service.engine.model_name),
+                    _sse(),
                     media_type="text/event-stream",
                     headers=SSE_HEADERS,
                 )
@@ -118,7 +211,7 @@ def _auto_graph_cache_max(max_seq: int) -> int:
     return 128
 
 
-def create_app_from_checkpoint(*, checkpoint: str,
+def build_service_and_app(*, checkpoint: str,
                                model_name: str = "qwen36-27b",
                                device: str = "cuda",
                                max_seq: int = 262208,
@@ -197,14 +290,24 @@ def create_app_from_checkpoint(*, checkpoint: str,
     if capsule_budget_bytes > 0:
         log.info("capsule pinning enabled, budget %.0f MB",
                  capsule_budget_bytes / (1 << 20))
-    return build_app(AgentService(
+    service = AgentService(
         engine,
         capsule_budget_bytes=capsule_budget_bytes,
         default_k=default_k,
         default_max_tokens=default_max_tokens,
         max_output_tokens=max_output_tokens,
         default_session_id=default_session_id,
-    ))
+    )
+    return service, build_app(service)
+
+
+def create_app_from_checkpoint(**kwargs):
+    """Back-compat shim returning just the FastAPI app.
+
+    ``main`` uses :func:`build_service_and_app` so it can wire the SIGTERM
+    handler that triggers deterministic GPU teardown on ``docker stop``.
+    """
+    return build_service_and_app(**kwargs)[1]
 
 
 def _parse_warmup_shapes(spec_csv: str) -> list[tuple[int, int]]:
@@ -268,7 +371,6 @@ def _warmup_preset_shapes(preset: str, max_seq: int) -> list[tuple[int, int]]:
 
 def main(argv: list[str] | None = None) -> None:
     import argparse
-    import uvicorn
 
     parser = argparse.ArgumentParser(
         description="FlashRT Qwen3.6 agent-serving OpenAI API")
@@ -353,7 +455,7 @@ def main(argv: list[str] | None = None) -> None:
         _warmup_preset_shapes(args.warmup_preset, args.max_seq)
         + _parse_warmup_shapes(args.warmup)
     )
-    app = create_app_from_checkpoint(
+    service, app = build_service_and_app(
         checkpoint=args.checkpoint,
         model_name=args.model_name,
         device=args.device,
@@ -370,8 +472,78 @@ def main(argv: list[str] | None = None) -> None:
         max_output_tokens=args.max_output_tokens,
         default_session_id=args.default_session_id,
     )
-    uvicorn.run(app, host=args.host, port=args.port,
-                log_level=args.log_level, access_log=args.access_log)
+
+    # Run uvicorn through a Server subclass that cancels in-flight GPU streams
+    # on SIGTERM *before* uvicorn starts draining connections. Plain
+    # ``uvicorn.run`` waits for in-flight requests to finish during graceful
+    # shutdown; a live streaming generation can run for tens of seconds
+    # (max output 65536 tokens), outlasting Docker's 10s stop grace, so Docker
+    # SIGKILLs the process mid-CUDA-op and on WSL2/Docker Desktop the dedicated
+    # GPU memory is not released until the VM / Docker Desktop restarts.
+    # Cancelling streams up front lets uvicorn exit inside the grace, so the
+    # lifespan GPU teardown (above) runs deterministically.
+    import asyncio
+    import signal
+    import threading
+
+    from uvicorn import Config, Server
+
+    class _GracefulGpuServer(Server):
+        def install_signal_handlers(self) -> None:
+            # Mirror uvicorn's own guard: signal handlers only work from the
+            # main thread. Outside it, defer to uvicorn's implementation.
+            if threading.current_thread() is not threading.main_thread():
+                super().install_signal_handlers()
+                return
+            loop = asyncio.get_event_loop()
+
+            def _on_signal(sig):
+                try:
+                    service.request_shutdown()
+                except Exception:
+                    log.exception(
+                        "shutdown signal handler: request_shutdown failed")
+                # Mirror uvicorn's own progression: a second signal forces exit.
+                if self.should_exit:
+                    self.force_exit = True
+                self.should_exit = True
+
+            try:
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, _on_signal, sig)
+            except NotImplementedError:
+                # Windows / non-main-thread: fall back to uvicorn's handlers.
+                super().install_signal_handlers()
+
+    # ``timeout_graceful_shutdown`` caps how long uvicorn waits for in-flight
+    # connections to close before force-closing them and running the ASGI
+    # lifespan shutdown hook (where release_gpu fires). Without it, a lingering
+    # streaming / keep-alive connection makes uvicorn wait indefinitely — on
+    # ``docker stop`` that outlasts Docker's stop grace, the process is
+    # SIGKILLed, and on WSL2/Docker Desktop dedicated VRAM can stay unreleased.
+    # Our own request_shutdown() cancels generation in ~1 decode cycle, so real
+    # connections close fast; this 5 s bound only covers a truly stuck client.
+    server = _GracefulGpuServer(Config(
+        app, host=args.host, port=args.port,
+        log_level=args.log_level, access_log=args.access_log,
+        timeout_graceful_shutdown=5))
+    try:
+        server.run()
+    finally:
+        # Belt-and-suspenders: covers uvicorn ``force_exit`` (second SIGTERM /
+        # Ctrl-C), where the ASGI lifespan shutdown hook is skipped. Both paths
+        # call the same idempotent teardown so VRAM is returned to the driver
+        # even on a forced exit.
+        try:
+            service.shutdown()
+        except Exception:
+            log.exception("main finally: service.shutdown failed")
+        release = getattr(service.engine, "release_gpu", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                log.exception("main finally: engine.release_gpu failed")
 
 
 if __name__ == "__main__":

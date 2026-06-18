@@ -43,6 +43,74 @@ class Qwen36FrontendAgentEngine:
         ptrs = getattr(weights, "ptrs", None) if weights is not None else None
         return bool(ptrs and ptrs.get("mtp") is not None)
 
+    def release_gpu(self) -> None:
+        """Tear the CUDA context down deterministically so the driver reclaims
+        VRAM on shutdown.
+
+        Called from the FastAPI lifespan shutdown hook and ``main``'s finally
+        block (both fire on ``docker stop`` SIGTERM). Without this, Docker's
+        stop grace expires while daemon decode threads still hold CUDA
+        contexts and the process is SIGKILLed mid-operation; on WSL2/Docker
+        Desktop that can leave dedicated GPU memory "in use" until the WSL VM
+        or Docker Desktop is restarted — the intermittent leak this fixes.
+
+        Synchronizing (wait for any in-flight kernel), dropping the frontend's
+        tensors / CUDA graphs / mempool, and emptying the caching allocator
+        returns the memory to the driver every time, regardless of what the
+        decode threads were doing when the signal arrived. Idempotent.
+        """
+        import gc
+
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        # Wait for any in-flight kernel (service.shutdown() already joins the
+        # producer threads, bounding this to ~one decode cycle) before freeing.
+        try:
+            torch.cuda.synchronize()
+        except Exception as exc:  # pragma: no cover - driver edge cases
+            log.warning("release_gpu: synchronize failed: %s", exc)
+
+        fe = self.fe
+        # Drop CUDA graphs + their mempool first: they reference device memory
+        # that torch.cuda.empty_cache() only returns once it is unreferenced.
+        if fe is not None:
+            for attr in (
+                "_decode_graphs", "_prefill_graphs", "_graph_cache",
+                "_mtp_chain_graphs", "_verify_graphs",
+                "_snap_graphs", "_mtp_verify_graphs",
+            ):
+                graphs = getattr(fe, attr, None)
+                if isinstance(graphs, dict):
+                    graphs.clear()
+            try:
+                fe._graph_mempool = None
+            except Exception:
+                pass
+            weights = getattr(fe, "_weights", None)
+            if weights is not None:
+                ptrs = getattr(weights, "ptrs", None)
+                if isinstance(ptrs, dict):
+                    ptrs.clear()
+        # Drop the frontend (weights, streams, KV cache, HF pipeline) so GC can
+        # free the tensors, then hand the device memory back to the driver.
+        self.fe = None
+        gc.collect()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception as exc:  # pragma: no cover
+            log.warning("release_gpu: empty_cache failed: %s", exc)
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        log.info("release_gpu: CUDA context torn down, VRAM returned to driver")
+
     @classmethod
     def from_checkpoint(
             cls, checkpoint: str, *, device: str = "cuda",
