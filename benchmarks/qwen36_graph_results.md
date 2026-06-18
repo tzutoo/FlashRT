@@ -97,26 +97,68 @@ slowdown).
 At `max_seq=32768` the cache is sized for 32K → ~7.5 GB free → decode stays
 ~130 tok/s flat across 1K–28K and short prompts stay fast after long requests.
 
+## CORRECTED: the real sweet spot is `--max-seq 229376` (2026-06-18)
+
+The 32768 conclusion above was too conservative — it throws away the project's
+long-context advantage. A proper multi-sample `max_seq` sweep
+(`qwen36_maxseq_sweep.py`, median of 3 samples per point) shows the VRAM cliff
+is **sharp and right at the top**: only the very last step (229376→245760)
+collapses. Everything up to 229376 keeps full speed **with up to 32K real
+context**, and 229376 gives a **224K context window** (97% of the original 240K):
+
+| max_seq | free MiB | 1K | 8K | 16K | 32K |
+|---:|---:|---:|---:|---:|---:|
+| 32768  | 7892 | 125 | 130 | 106 | 120 |
+| 65536  | 6383 | 127 | 127 | 108 | 121 |
+| 98304  | 4904 | 127 | 130 | 108 | 120 |
+| 131072 | 3462 | 127 | 130 | 108 | 118 |
+| 163840 | 2164 | 122 | 125 | 106 | 120 |
+| 196608 |  844 | 122 | 126 | 108 | 120 |
+| **229376** | **944** | **121** | **130** | **107** | **119** |
+| 245760 |  364 | 122 | **27** | **25** | **27** |  ← cliff
+
+Verified live at `--max-seq 229376`: free VRAM 960 MiB, agent sim 72–110 tok/s,
+**32K-context decode 105 tok/s** (vs 27 at 245760). Graphs stay OFF for serving
+(see the agent-traffic section below).
+
+### Why graphs OFF stays correct at every max_seq
+
+CUDA graphs are keyed on the **absolute decode position** (`cur_pos`). An agent
+conversation grows monotonically, so every generated token is at a
+never-visited position → under graphs ON every decode step is a ~23 tok/s cold
+capture, never a warm replay. `max_seq` doesn't change this — the decision is
+about whether positions *repeat*, not the window size. Graphs ON only wins when
+the *same* prompt re-runs (benchmarks/demos). Confirmed by `qwen36_agent_sim.py`:
+
+| turn | graphs OFF @32k | graphs ON @32k |
+|---|---|---|
+| 1 | 106 tok/s | 31 tok/s |
+| 5 |  87 tok/s | 21 tok/s |
+
+The serving README explicitly says the same: "Do not set
+`FLASHRT_QWEN36_TQ_VERIFY_GRAPH=1`... for normal agent serving."
+
 ### Recommendation
 
-For pi / agent coding use (context rarely exceeds 32K), run with
-`--max-seq 32768` (≈5× faster decode at typical contexts, 8 GB headroom).
-Tradeoff: 32K context window instead of 240K. Intermediate values (e.g. 65536,
-131072) trade context for headroom; the cliff tracks free VRAM, so measure idle
-`nvidia-smi` and keep ≥3–4 GB free.
+Run with `--max-seq 229376` — 224K context **and** ~105–130 tok/s at every
+realistic context size. This keeps FlashRT's long-context advantage (the
+project's whole point) without the 245760 starvation cliff. Intermediate
+values (e.g. 196608) trade a little context for more VRAM headroom.
 
 ```bash
 docker run ... flashrt-server:5090 \
     python3 -m serving.qwen36_agent.server --checkpoint /nvfp4 \
-    --max-seq 32768 --route-min-seq 0 \
+    --max-seq 229376 --route-min-seq 0 \
     --default-max-tokens 8192 --max-output-tokens 65536 \
     --host 0.0.0.0 --port 8000
 ```
 
-Note: this contradicts the `BUILD_NOTES.md` context-sweep table (which claims
-88–99 tok/s at 64K–200K with `--max-seq 245760`). That table does not reproduce
-on this build (2026-06-18): `--max-seq 245760` measures ~24 tok/s at ≥4K. The
-graph-ON numbers in `BUILD_NOTES.md` (~142 warm) *do* reproduce.
+### Methodology lesson (important)
+
+Single-sample sweeps are misleading here. An earlier single-sample sweep
+reported 116 tok/s at 16K for `245760` — a lucky first sample before the TQ
+cache filled. The 8-sample re-measurement showed steady ~31 tok/s. Always use
+multiple samples + session cleanup between them (`qwen36_maxseq_sweep.py`).
 
 ## Graphs ON even at 32768? No — agent positions never repeat (2026-06-18)
 

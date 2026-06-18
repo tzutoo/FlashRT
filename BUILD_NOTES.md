@@ -107,7 +107,7 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" || exit 1
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", \
-     "--max-seq", "245760", "--route-min-seq", "0", \
+     "--max-seq", "229376", "--route-min-seq", "0", \
      "--default-max-tokens", "8192", "--max-output-tokens", "65536", \
      "--host", "0.0.0.0", "--port", "8000"]
 ```
@@ -177,10 +177,10 @@ docker run --restart always --gpus all --ipc=host \
 ```
 
 The Dockerfile bakes in:
-- `--max-seq 245760` (240K context window)
+- `--max-seq 229376` (224K context window)
 - `--route-min-seq 0` (FP8-KV path for all prompts — avoids per-position graph capture)
 - `--default-max-tokens 8192` (default output budget)
-- `--max-output-tokens 65536` (hard cap; input + output share the 240K pool dynamically)
+- `--max-output-tokens 65536` (hard cap; input + output share the 224K pool dynamically)
 
 | Env var | Purpose |
 |---------|---------|
@@ -198,7 +198,7 @@ Startup takes ~10s. Verify:
 
 ```bash
 curl -s http://localhost:8000/v1/models/qwen36-27b
-# {"id":"qwen36-27b","object":"model","owned_by":"flash-rt","context_length":245760,"max_output_tokens":65536}
+# {"id":"qwen36-27b","object":"model","owned_by":"flash-rt","context_length":229376,"max_output_tokens":65536}
 
 curl -s http://localhost:8000/v1/chat/completions \
     -H 'Content-Type: application/json' \
@@ -238,7 +238,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
           "name": "Qwen3.6 27B NVFP4 (local RTX 5090)",
           "tool_call": true,
           "temperature": false,
-          "limit": { "context": 245760, "output": 65536 },
+          "limit": { "context": 229376, "output": 65536 },
           "cost": { "input": 0, "output": 0 }
         }
       }
@@ -259,7 +259,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
 ## Performance
 
 All numbers measured on RTX 5090 (SM120, 32 GB VRAM) in WSL2 Docker,
-`--max-seq 245760`, `--route-min-seq 0`, FP8-KV, speculative decode K=4,
+`--max-seq 229376`, `--route-min-seq 0`, FP8-KV, speculative decode K=4,
 CUDA graph flags off (production default).
 
 | Metric | Value |
@@ -269,7 +269,7 @@ CUDA graph flags off (production default).
 | 64K context decode | **~89 tok/s** |
 | 200K context decode | **~97 tok/s** |
 | Without speculative decode | ~36 tok/s (K=1, no MTP) |
-| Context window | 240K tokens |
+| Context window | 224K tokens |
 | Max output tokens | 65,536 |
 | VRAM usage | ~31.2 GB (leaving ~900 MiB free) |
 
@@ -297,13 +297,25 @@ CUDA graph flags off (production default).
 
 Only new tokens prefilled each turn. TTFT stays flat (~50ms) regardless of context growth.
 
-### Why 240K instead of 256K?
+### Why 229376 instead of 245760 or 256K?
 
-`--max-seq 262208` (256K) leaves only ~167 MiB VRAM free. At 64K+ real context
-this causes catastrophic slowdown (18-21 tok/s) — the GPU is memory-starved
-during attention. `--max-seq 245760` (240K) leaves ~900 MiB free, giving
-consistent 88-110 tok/s across all context sizes. Tradeoff: 16K less max-input
-(180K vs 197K when output is maxed at 65K).
+The VRAM cliff on a 32 GB RTX 5090 is **sharp and right at the top**. A
+multi-sample `max_seq` sweep (see `benchmarks/qwen36_maxseq_sweep.py`) shows:
+
+| `--max-seq` | free VRAM | decode @1K/8K/16K/32K |
+|---|---|---|
+| 196608 (192K) | ~844 MiB | ~122 / 126 / 108 / 120 tok/s |
+| **229376 (224K)** | **~944 MiB** | **~121 / 130 / 107 / 119 tok/s** |
+| 245760 (240K) | ~364 MiB | 122 / **27** / **25** / **27** tok/s ← cliff |
+| 262208 (256K) | <200 MiB | catastrophic (18-21 tok/s) |
+
+Only the very last step (229376→245760) collapses decode. `--max-seq 229376`
+keeps a **224K context window** (97% of 240K) **and** ~105–130 tok/s at every
+realistic context size. The earlier `245760`/`262208` values memory-starve the
+attention path. Intermediate values trade context for headroom; the cliff
+tracks free VRAM, so keep ≥900 MiB idle free. (This value supersedes the
+240K number in earlier revisions of this file; see
+`benchmarks/qwen36_graph_results.md` for the full sweep and methodology.)
 
 ### Speculative decode K
 
