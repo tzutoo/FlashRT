@@ -71,6 +71,53 @@ each request so a long sweep doesn't accumulate KV and starve VRAM (see
 
 Both are real and separate from the graph on/off decision.
 
+## Root cause found (2026-06-18, follow-up)
+
+**Both open questions are one bug: `--max-seq 245760` oversizes the
+long-context KV cache and memory-starves the card.** Single-variable proof —
+identical graphs-OFF config, identical prompts, only `--max-seq` differs:
+
+| metric | `--max-seq 245760` | `--max-seq 32768` |
+|---|---|---|
+| idle VRAM used | ~31 880 MiB (~700 MiB free) | ~25 085 MiB (~7.5 GB free) |
+| decode @1K ctx | 120 tok/s | 130 tok/s |
+| decode @4K–32K ctx | **~24 tok/s** (cliff at the 2048 BF16 window) | **~130 tok/s** (flat) |
+| 32K request decode | 19 tok/s | **95 tok/s** |
+| short prompt *after* a 32K req | **21 tok/s** (stuck slow) | **104 tok/s** (no slowdown) |
+
+Mechanism: in long-ctx mode the BF16 spec window is `min(2048, MAX_Q_SEQ)`.
+With `--route-min-seq 0`, *every* prompt (even 38 tokens) takes the long
+TQ-packed route. At `max_seq=245760` the TQ cache is sized for 240K → ~700 MiB
+free → attention is memory-starved → decode collapses to ~24 tok/s for anything
+above the 2048 window, **and** the long path gets stuck slow even for short
+prompts after any long request (deleting sessions does not help; only a restart
+restores speed — the frontend GPU state, not the session registry, holds the
+slowdown).
+
+At `max_seq=32768` the cache is sized for 32K → ~7.5 GB free → decode stays
+~130 tok/s flat across 1K–28K and short prompts stay fast after long requests.
+
+### Recommendation
+
+For pi / agent coding use (context rarely exceeds 32K), run with
+`--max-seq 32768` (≈5× faster decode at typical contexts, 8 GB headroom).
+Tradeoff: 32K context window instead of 240K. Intermediate values (e.g. 65536,
+131072) trade context for headroom; the cliff tracks free VRAM, so measure idle
+`nvidia-smi` and keep ≥3–4 GB free.
+
+```bash
+docker run ... flashrt-server:5090 \
+    python3 -m serving.qwen36_agent.server --checkpoint /nvfp4 \
+    --max-seq 32768 --route-min-seq 0 \
+    --default-max-tokens 8192 --max-output-tokens 65536 \
+    --host 0.0.0.0 --port 8000
+```
+
+Note: this contradicts the `BUILD_NOTES.md` context-sweep table (which claims
+88–99 tok/s at 64K–200K with `--max-seq 245760`). That table does not reproduce
+on this build (2026-06-18): `--max-seq 245760` measures ~24 tok/s at ≥4K. The
+graph-ON numbers in `BUILD_NOTES.md` (~142 warm) *do* reproduce.
+
 ## How to reproduce
 
 ```bash
