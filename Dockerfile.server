@@ -15,4 +15,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" || exit 1
 
-CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "196608", "--route-min-seq", "0", "--default-max-tokens", "8192", "--max-output-tokens", "65536", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", "--max-seq", "196608", "--route-min-seq", "0", "--default-max-tokens", "32768", "--max-output-tokens", "65536", "--host", "0.0.0.0", "--port", "8000"]

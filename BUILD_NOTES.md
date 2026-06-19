@@ -108,7 +108,7 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", \
      "--max-seq", "196608", "--route-min-seq", "0", \
-     "--default-max-tokens", "8192", "--max-output-tokens", "65536", \
+     "--default-max-tokens", "32768", "--max-output-tokens", "65536", \
      "--host", "0.0.0.0", "--port", "8000"]
 ```
 
@@ -179,7 +179,7 @@ docker run --restart always --gpus all --ipc=host \
 The Dockerfile bakes in:
 - `--max-seq 196608` (192K context window)
 - `--route-min-seq 0` (FP8-KV path for all prompts — avoids per-position graph capture)
-- `--default-max-tokens 8192` (default output budget)
+- `--default-max-tokens 32768` (default output budget)
 - `--max-output-tokens 65536` (hard cap; input + output share the 192K pool dynamically)
 
 | Env var | Purpose |
@@ -216,7 +216,21 @@ docker rm -f flashrt-qwen36         # Remove container
 
 ---
 
-## Step 5: Configure opencode
+## Step 5: Configure clients (pi / opencode / hermes)
+
+The server reports `context_length=196608` and `max_output_tokens=65536` via
+`/v1/models`, but most clients **do not auto-query the server** — they read a
+static `contextWindow`/`maxTokens` from their own config at startup. So every
+client config must be set to match the server, or the client's meter / compaction
+will use the wrong numbers (and an over-large client `maxTokens` won't actually
+raise the budget the server honors for *other* clients).
+
+| value | server | what clients must set |
+|---|---|---|
+| context window | `--max-seq 196608` | `contextWindow` / `context_length` / `limit.context` = **196608** |
+| output budget | `--default-max-tokens 32768` (cap `--max-output-tokens 65536`) | `maxTokens` / `limit.output` = **32768** (see note below) |
+
+### opencode
 
 Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.json`):
 
@@ -238,7 +252,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
           "name": "Qwen3.6 27B NVFP4 (local RTX 5090)",
           "tool_call": true,
           "temperature": false,
-          "limit": { "context": 196608, "output": 65536 },
+          "limit": { "context": 196608, "output": 32768 },
           "cost": { "input": 0, "output": 0 }
         }
       }
@@ -253,6 +267,90 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
 | `npm` | `@ai-sdk/openai-compatible` | Required for custom endpoints |
 | `temperature` | `false` | Server is greedy-only (no sampling) |
 | `baseURL` | `http://127.0.0.1:8000/v1` | Must include `/v1`. Server binds `0.0.0.0` for WSL2 |
+| `limit.context` / `limit.output` | `196608` / `32768` | Must match the server (see output-budget note) |
+
+### pi
+
+`~/.pi/agent/models.json` (WSL2) and `C:\Users\<you>\.pi\agent\models.json`
+(Windows) — register the `flashrt` provider with the same numbers:
+
+```json
+{
+  "providers": {
+    "flashrt": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "-",
+      "compat": { "supportsDeveloperRole": true },
+      "models": [{
+        "id": "qwen36-27b",
+        "name": "Qwen3.6 27B NVFP4 (local RTX 5090)",
+        "contextWindow": 196608,
+        "maxTokens": 32768,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+      }]
+    }
+  }
+}
+```
+
+Restart pi after editing — it reads `models.json` at launch, not per request.
+
+### hermes
+
+`~/.hermes/config.yaml` (WSL2) and `C:\Users\<you>\AppData\Local\hermes\config.yaml`
+(Windows). Two non-obvious rules:
+
+1. **Per-model value, not global.** Put `context_length` under
+   `custom_providers[].models.<model>`, **not** at the top-level `model:` block.
+   A top-level `model.context_length` *overrides* the per-provider value (hermes
+   checks the global first), so a leftover global `context_length: 1000000` will
+   make the status bar show 1M for every provider. Omit the global override.
+2. **No `max_tokens` on the flashrt model.** hermes reads `max_tokens` only from
+   the global `model.max_tokens` / `HERMES_MAX_TOKENS` env (no per-provider
+   field), and setting it globally would also cap other providers (e.g. glm).
+   Leave it unset — hermes then omits `max_tokens` in requests and inherits the
+   **server default (32768)**, which is exactly what you want.
+
+```yaml
+custom_providers:
+- name: flashrt                       # meaningful name (NOT a UUID)
+  base_url: http://127.0.0.1:8000/v1
+  api_key: '-'
+  models:
+    qwen36-27b:
+      name: Qwen3.6 27B NVFP4 (local RTX 5090)
+      context_length: 196608          # MUST be under models.<model>, not top-level
+  model: qwen36-27b
+```
+
+### cc-switch (if you manage providers via cc-switch)
+
+cc-switch writes its `providers` table into the agent configs. The provider's
+**`id`** becomes the name written into the hermes config — so a UUID `id` leaks
+into `~/.hermes/config.yaml` as `provider: 7b2ca8fd-…`. Use a meaningful `id`
+(`flashrt`) so all configs stay consistent. The `providers` PK is
+`(id, app_type)`, so `flashrt`/hermes does not collide with `flashrt`/opencode.
+The opencode-provider row stores the model limit in `settings_config`
+(`models.qwen36-27b.limit.{context,output}`) — keep it at 196608 / 32768.
+
+### Output-budget note (why 32768, and the cap-vs-default distinction)
+
+The server has **two** output knobs:
+
+- `--default-max-tokens 32768` — used **only** when a request omits `max_tokens`
+  (this is what hermes does). Raising this affects hermes and any client that
+  omits the field.
+- `--max-output-tokens 65536` — the **hard ceiling**. Any request above this is
+  clamped down (not rejected).
+
+Clients that always send `max_tokens` (pi, opencode) honor their own value up to
+the hard cap, so raising the server *default* alone does **not** affect them —
+you must set the client's `maxTokens`/`limit.output`. That's why both the server
+default and every client are set to **32768** for consistency: a generous
+budget for long summaries, still well under the 65536 ceiling. If you only ever
+use pi, you can lower the server default back to 8192 (the client value governs
+pi) without affecting it.
 
 ---
 
@@ -270,7 +368,8 @@ CUDA graph flags off (production default).
 | 200K context decode | **~97 tok/s** |
 | Without speculative decode | ~36 tok/s (K=1, no MTP) |
 | Context window | 192K tokens |
-| Max output tokens | 65,536 |
+| Default output budget | 32,768 (server default; matches pi/hermes configs) |
+| Max output tokens (hard cap) | 65,536 |
 | VRAM usage | ~31.2 GB (leaving ~900 MiB free) |
 
 ### Context sweep (128 output tokens, no session reuse)
@@ -307,7 +406,7 @@ grow past 95K tokens; at `--max-seq 131072` (128K) those sessions overflowed
 pi as a broken `Stream ended without finish_reason`.
 
 `--max-seq 196608` (192K) comfortably fits a 95K session + multi-turn growth +
-the 8192 default output budget, with measured steady-state decode of
+the 32768 default output budget, with measured steady-state decode of
 ~108–120 tok/s up to 32K real context. It leaves ~1.3 GB idle free VRAM —
 borderline, so under extreme session growth + an unlucky WSL2 free-VRAM drift
 you may see decode slow to ~30 tok/s; a `docker restart` clears it.
