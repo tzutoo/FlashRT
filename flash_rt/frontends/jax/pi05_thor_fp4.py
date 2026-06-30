@@ -80,6 +80,8 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         awq_calib_iters: int = 8,
         use_p1_split_gu: bool = False,
         use_fp8: bool = True,
+        state_prompt_mode: str = "exact",
+        state_prompt_fixed_max_len=None,
         **kwargs,
     ):
         # Set FP4 state BEFORE super().__init__ because the base class
@@ -120,6 +122,8 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
             autotune=autotune,
             weight_cache=weight_cache,
             use_fp8=use_fp8,
+            state_prompt_mode=state_prompt_mode,
+            state_prompt_fixed_max_len=state_prompt_fixed_max_len,
             **kwargs,
         )
 

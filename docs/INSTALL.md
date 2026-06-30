@@ -126,6 +126,46 @@ cmake -B build -S . -DFA2_ARCH_NATIVE_ONLY=ON
 cmake --build build -j$(nproc)
 ```
 
+### 6.2 Slim VLA build (optional)
+
+The default build keeps FlashRT's broad compatibility surface. It compiles
+shared kernels plus several model- or architecture-specific translation units
+so existing model paths keep their historical bindings.
+
+For deployment builds that only need the current VLA-oriented surface, you can
+opt into a smaller compile surface:
+
+```bash
+cmake -B build -S . -DGPU_ARCH=<arch> -DFLASHRT_SLIM_BUILD=ON
+cmake --build build -j$(nproc) --target flash_rt_kernels
+```
+
+`FLASHRT_SLIM_BUILD` is OFF by default and only changes what is compiled into
+`flash_rt_kernels`. It does not change kernel math, launch parameters, dtype
+selection, graph capture, runtime routing, or fallback policy.
+
+In slim mode, the build drops kernel groups that the current VLA deployment
+surface does not need:
+
+- Motus VAE FP8 quantize kernels.
+- Qwen3.6 / linear-attention kernels and their legacy Qwen3.6 binding names.
+- SM120/NVFP4-named helper translation units on non-NVFP4 builds.
+
+Neutral shared helpers stay compiled in both modes, including
+`bf16_matmul_bf16` and `embedding_lookup_bf16`. Architecture-required kernels
+also stay compiled when their architecture macro is enabled; for example,
+SM120/NVFP4 builds retain NVFP4-required sources even with slim mode enabled.
+
+Do not use `FLASHRT_SLIM_BUILD=ON` for compatibility builds or for model paths
+that require the gated bindings, such as Qwen3.6 / Nex-N2, Motus FP8/VAE, or
+non-VLA NVFP4 conversion flows. Those paths should use the default build until
+they have their own documented build profile.
+
+This option is a first step toward explicit build profiles. It is not yet a
+general `vla` / `llm` / `vlm` / `tts` / `video` profile system; it is a
+conservative opt-in compile-time reduction with tests covering the exported
+binding surface.
+
 ## 7. Verify
 
 ```bash
@@ -220,3 +260,41 @@ See [USAGE.md](../USAGE.md) §Loading a model for the per-frontend
 | `PJRT plugin ... not found` at JAX import | JAX / jax-cuda12-plugin version mismatch (Step 8) |
 | `cuBLAS error code=13` when loading second model | Ran two model loads in one process; subprocess-isolate per model |
 | cos regression right after calibrate | `act_scale * weight_scale` alpha computed in f64 somewhere; see `docs/calibration.md` §2.3 |
+
+## 12. Known runtime issue: cuBLASLt FP8 heuristic `code=15`
+
+Some FP8 cuBLASLt descriptors are sensitive to the cuBLASLt runtime
+patch version. `CUDA 13`, `CUDA 12.4`, or `libcublasLt.so.13` alone is
+not specific enough to identify the runtime behavior.
+
+If an FP8 GEMM fails with:
+
+```text
+cublasLtMatmulAlgoGetHeuristic(...), CUBLAS_STATUS_NOT_SUPPORTED / code=15
+```
+
+first print the exact cuBLASLt runtime version from the same Python
+environment that imports `flash_rt`:
+
+```python
+import ctypes
+import ctypes.util
+
+lib = ctypes.CDLL(ctypes.util.find_library("cublasLt"))
+lib.cublasLtGetVersion.restype = ctypes.c_size_t
+print(lib.cublasLtGetVersion())
+```
+
+Known local result on the same RTX 5090 and the same FP8 descriptor:
+
+| cuBLASLt runtime | Result |
+|---|---|
+| `13.0.2` (`cublasLtGetVersion() == 130002`) | one SM120 FP8 NN descriptor returned `code=15` |
+| `13.1.0` (`cublasLtGetVersion() == 130100`) | the same descriptor succeeded |
+
+On SM89, FP8 fused epilogue descriptors can show the same class of
+failure on older CUDA/cuBLASLt stacks. Treat this as a runtime-library
+capability issue until the exact cuBLASLt version, GPU, descriptor
+shape/layout, and epilogue have been checked. Prefer the validated
+Docker/NGC stack when debugging FP8 cuBLASLt heuristic failures, and
+include `cublasLtGetVersion()` in bug reports.

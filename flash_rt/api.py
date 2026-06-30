@@ -216,16 +216,17 @@ class VLAModel:
         observations,
         *,
         percentile: float = 99.9,
-        max_samples=None,
+        max_samples: int | None = None,
         verbose: bool = False,
     ) -> None:
         """Unified calibration entry point.
 
         Args:
             observations: single dict or iterable of dicts. N=1 triggers
-                the single-frame calibration path (back-compatible); N>=2
-                engages dataset calibration with percentile-clipped amax
-                reduction (RTX frontends only today).
+                the single-frame calibration path (back-compatible). Frontends
+                that document N>=2 support run dataset calibration with
+                percentile-clipped amax reduction; unsupported frontends raise
+                a clear NotImplementedError from their calibrate() method.
             percentile: percentile for multi-sample amax reduction. 99.9
                 by default; 100.0 == traditional max.
             max_samples: optional cap.
@@ -297,7 +298,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                cache_frames=None,
                use_fp16=False,
                use_fp8=True,
-               state_prompt_mode="exact"):
+               state_prompt_mode="exact",
+               state_prompt_fixed_max_len=None):
     """Load a FlashRT model.
 
     Args:
@@ -350,23 +352,29 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         action_horizon: GROOT only. Number of action steps to generate per
             inference (default = ``ACTION_HORIZON_MAX`` = 50). Set to a
             smaller value (e.g. 16 for LIBERO) to reduce DiT compute.
-        use_fp4: Pi0.5 torch only. If True, enable NVFP4 quantization on the
-            selected encoder FFN layers (Gate+Up + Down GEMMs). Requires
-            SM100+ GPU (Thor SM110) and the flash_rt_fp4 extension. Falls
-            back to FP8 with a warning if the extension is unavailable.
-            Default False (production FP8 baseline).
-            Validated on LIBERO Spatial: 491/500 = 98.2% (matches baseline).
+        use_fp4: Pi0.5 torch and JAX on Thor. If True, enable NVFP4
+            quantization on the selected encoder FFN layers (Gate+Up + Down
+            GEMMs). Requires SM100+ GPU (Thor SM110) and the flash_rt_fp4
+            extension. Uses the FP8 route with a warning if the extension is
+            unavailable. Default False (production FP8 baseline).
+            Torch uses safetensors checkpoints; JAX uses Orbax checkpoints.
+            Validated on LIBERO Spatial for the torch path: 491/500 = 98.2%
+            (matches baseline). JAX FP4 has Thor precision / replay-latency
+            validation against a same-origin PyTorch reference.
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
-            applies when use_fp4=True). Default (7, 8, 9) = middle FFN
-            subset, LIBERO-validated. Other subsets untested at task level.
+            applies when use_fp4=True). ``None`` resolves to the production
+            preset, full 18 encoder FFN layers with AWQ + P1 split-GU.
+            Explicit tuples override the preset; `(7, 8, 9)` is the
+            conservative middle-FFN subset.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
-        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5, GROOT N1.6,
-            and GROOT N1.7 (torch, RTX SM120/SM89). Only valid with
-            ``use_fp8=False``; an A/B reference against the quantized default.
-            On GROOT N1.7 the default is FP8 (FP8 backbone + bf16 DiT), so
-            ``use_fp8=False`` without ``use_fp16=True`` raises.
+        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on RTX
+            SM120/SM89, GROOT N1.6 on Thor/RTX SM120, and GROOT N1.7 on
+            Thor/RTX SM120/SM89. Only valid with ``use_fp8=False``; an A/B
+            reference against the quantized default. On GROOT N1.7 the
+            default is FP8 (FP8 backbone + bf16 DiT), so ``use_fp8=False``
+            without ``use_fp16=True`` raises.
         num_steps: Pi0/Pi0.5 torch only when supported. Number of
             flow-matching ODE steps. ``None`` uses the frontend default.
         vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
@@ -379,33 +387,44 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
-        state_prompt_mode: Pi0.5 torch RTX only. How the variable-length
+        state_prompt_mode: Pi0.5 RTX/Thor only. How the variable-length
             state-in-prompt is mapped to CUDA graphs:
-              ``"exact"`` (default) — one captured graph per exact prompt
-                length, cached; pair with ``warm_state_prompt_buckets()`` to
-                front-load the lengths you expect. Unchanged legacy behavior.
+              ``"exact"`` (default) — graph shape tracks the exact prompt
+                length. RTX caches recurring lengths and can front-load them
+                with ``warm_state_prompt_buckets()``; Thor reuses same-length
+                updates and recaptures when the exact length changes.
               ``"fixed"`` — ONE graph at the max prompt length serves every
-                length (padded prefix masked via FA2 ``seqused_k`` + decoder
-                K/V appended at the valid offset); a changing length never
-                re-captures and no warmup is needed. Requires the vendored
-                bf16 FA2 path (``FVK_RTX_FA2=1``, encoder+decoder sites on).
+                length (padded prefix masked by a device-side valid length +
+                decoder K/V appended at the valid offset); a changing length
+                never re-captures and no warmup is needed. RTX uses the
+                vendored bf16 FA2 path; Thor uses its cuBLAS-decomposed
+                attention path.
                 Cost: every inference runs at the padded max length, so it is
                 ~1 ms slower than a warmed ``"exact"`` graph (split-KV decoder
-                joint-attention keeps the padding overhead small). Prefer
-                ``"fixed"`` when the state-token length drifts and you'd rather
-                not enumerate/warm lengths; prefer ``"exact"`` + warmup for
-                absolute peak latency at known lengths.
+                joint-attention keeps the padding overhead small on RTX; Thor
+                uses its cuBLAS-decomposed attention path with device-side
+                valid-length masking). Prefer ``"fixed"`` when the state-token
+                length drifts and you'd rather not enumerate/warm lengths;
+                prefer ``"exact"`` + warmup for absolute peak latency at known
+                lengths.
             Env override: ``FLASHRT_PI05_STATE_PROMPT_MODE``.
+        state_prompt_fixed_max_len: Pi0.5 Thor fixed mode only. Padded
+            state-prompt token capacity used when ``state_prompt_mode="fixed"``.
+            ``None`` keeps the frontend default (200 tokens). Lower this when
+            the serving stack can bound the live state prompt length; for
+            example, a cap near the actual length (120 vs. 117 tokens) measured
+            about a 1 ms normal overhead on Thor versus warmed exact mode.
+            Env override: ``FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN``.
 
     Returns:
         VLAModel instance with .predict() method.
     """
     if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b", "cosmos3_video"):
+                      "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_video")
+            f"wan22_ti2v_5b, cosmos3_video, nexn2")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
@@ -427,6 +446,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             use_awq = False
         if use_p1_split_gu is None:
             use_p1_split_gu = False
+
+    # Nex-N2-mini (qwen3_5_moe) is a text LLM, not a VLA: its frontend exposes
+    # infer()->logits / generate() rather than the predict(images, ...) surface
+    # that load_model's VLAModel wraps. It is registered in _PIPELINE_MAP for
+    # discoverability but constructed directly (checked before GPU detection so
+    # the redirect fires on any machine).
+    if config == "nexn2":
+        raise NotImplementedError(
+            "config='nexn2' is a text LLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.nexn2_rtx import "
+            "Nexn2TorchFrontendRtx\n"
+            "See docs/nexn2_usage.md.")
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
@@ -451,14 +483,30 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0")
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+    if use_fp16:
+        if use_fp8:
+            raise ValueError("use_fp16=True requires use_fp8=False")
+        if (config, framework, arch) not in {
+            ("pi05", "torch", "rtx_sm120"),
+            ("pi05", "torch", "rtx_sm89"),
+            ("groot", "torch", "thor"),
+            ("groot", "torch", "rtx_sm120"),
+            ("groot_n17", "torch", "thor"),
+            ("groot_n17", "torch", "rtx_sm120"),
+            ("groot_n17", "torch", "rtx_sm89"),
+        }:
+            raise ValueError(
+                "use_fp16=True is currently experimental and only supports "
+                "('pi05', 'torch', 'rtx_sm120'/'rtx_sm89'), "
+                "('groot', 'torch', 'thor'/'rtx_sm120'), and "
+                "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
+
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 
-    # GROOT N1.7 on RTX: default to the framework-conforming FP8 frontend. The
-    # whole ViT/LLM/VL-self-attn backbone runs FP8 kernels via the SM120-safe
-    # descale pattern (no torch matmul on the serving feature path; activation
-    # scales come from the on-disk calibration cache, the torch shadow runs only
-    # on a cold cache miss). The DiT stays bf16 for Thor parity. ``use_fp16=True``
-    # opts into the full-FP16 frontend below (no FP8, non-quantized reference).
+    # GROOT N1.7 on RTX defaults to the framework-conforming FP8 frontend.
+    # rtx_sm120 keeps the historical shared-base registration and is refined
+    # here to the explicit FP8 production frontend. rtx_sm89 is already
+    # registered directly to its dedicated FP8 frontend in _PIPELINE_MAP.
     if config == "groot_n17" and framework == "torch" \
             and arch in ("rtx_sm120", "rtx_sm89") and not use_fp16:
         if not use_fp8:
@@ -466,10 +514,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "GROOT N1.7 on RTX defaults to FP8; there is no separate "
                 "non-FP16 BF16 fallback. For the non-quantized full-FP16 "
                 "reference pass use_fp16=True, use_fp8=False.")
-        from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
-            GrootN17TorchFrontendRtxFP8,
-        )
-        pipe_cls = GrootN17TorchFrontendRtxFP8
+        if arch == "rtx_sm120":
+            from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
+                GrootN17TorchFrontendRtxFP8,
+            )
+            pipe_cls = GrootN17TorchFrontendRtxFP8
 
     # GROOT N1.7 on Thor (SM110) runs the FP8 backbone (+ bf16 DiT) by
     # default. There is no BF16-only fallback; the non-quantized reference is
@@ -483,8 +532,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "use_fp16=True together with use_fp8=False.")
 
     if use_fp16:
-        if use_fp8:
-            raise ValueError("use_fp16=True requires use_fp8=False")
         # GROOT N1.6 Thor full-FP16 reference: the same fully-kernelized,
         # CUDA-graph pipeline as the FP8 production frontend, with the GEMMs run
         # in FP16 instead of per-tensor FP8 (an A/B accuracy baseline).
@@ -502,14 +549,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             )
             pipe_cls = GrootN17TorchFrontendThorFP16
         else:
-            fp16_arches = ("rtx_sm120", "rtx_sm89")
-            if config not in ("pi05", "groot", "groot_n17") or framework != "torch" \
-                    or arch not in fp16_arches:
-                raise ValueError(
-                    "use_fp16=True is currently experimental and only supports "
-                    "config in {'pi05', 'groot', 'groot_n17'}, framework='torch', "
-                    "hardware in {'thor' (groot/groot_n17 only), 'rtx_sm120', "
-                    "'rtx_sm89'}")
             if config == "pi05":
                 from flash_rt.frontends.torch.pi05_rtx_fp16 import (
                     Pi05TorchFrontendRtxFP16,
@@ -521,18 +560,25 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 )
                 pipe_cls = GrootTorchFrontendRtxFP16
             else:  # config == "groot_n17"
-                from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
-                    GrootN17TorchFrontendRtxFP16,
-                )
-                pipe_cls = GrootN17TorchFrontendRtxFP16
+                if arch == "rtx_sm89":
+                    from flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16 import (
+                        GrootN17TorchFrontendRtxSm89FP16,
+                    )
+                    pipe_cls = GrootN17TorchFrontendRtxSm89FP16
+                else:
+                    from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
+                        GrootN17TorchFrontendRtxFP16,
+                    )
+                    pipe_cls = GrootN17TorchFrontendRtxFP16
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
     if use_fp4:
-        if config != "pi05" or framework not in ("torch", "jax"):
+        if config != "pi05" or framework not in ("torch", "jax") or arch != "thor":
             logger.warning(
                 "use_fp4=True is only supported for config='pi05' with "
-                "framework in ('torch', 'jax'); got config='%s' framework='%s'. "
-                "Falling back to FP8.", config, framework)
+                "framework in ('torch', 'jax') on Thor; got config='%s' "
+                "framework='%s' hardware='%s'. Falling back to FP8.",
+                config, framework, arch)
             use_fp4 = False
         else:
             try:
@@ -612,6 +658,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         # capture) / "fixed" (opt-in, one graph). Forwarded only if accepted.
         if "state_prompt_mode" in sig.parameters:
             kwargs["state_prompt_mode"] = state_prompt_mode
+        if (state_prompt_fixed_max_len is not None and
+                "state_prompt_fixed_max_len" in sig.parameters):
+            kwargs["state_prompt_fixed_max_len"] = state_prompt_fixed_max_len
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

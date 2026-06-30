@@ -39,7 +39,7 @@ def load_model(
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
-    # Pi0.5 torch-specific:
+    # Pi0.5-specific:
     use_fp4: bool = False,
     fp4_layers: tuple[int, ...] | None = None,
     use_awq: bool | None = None,
@@ -49,6 +49,8 @@ def load_model(
     vision_pool_factor: int | None = None,
     vision_num_layers: int | None = None,
     cache_frames: int | None = None,
+    state_prompt_mode: str = "exact",
+    state_prompt_fixed_max_len: int | None = None,
     # Frontends with an FP8/BF16 switch:
     use_fp8: bool = True,
     # Pi0.5 torch RTX SM120/SM89 opt-in:
@@ -63,18 +65,38 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   Pi0-FAST.
 - `embodiment_tag` and `action_horizon` apply to GROOT.
 - `use_fp4`, `fp4_layers`, `use_awq`, `awq_alpha`, and
-  `use_p1_split_gu` apply to the Pi0.5 torch NVFP4 encoder path.
+  `use_p1_split_gu` apply to the Pi0.5 torch and JAX NVFP4 encoder path on
+  Thor. The JAX path loads Orbax checkpoints; the torch path loads
+  safetensors checkpoints.
 - `num_steps`, `vision_pool_factor`, `vision_num_layers`, and
   `cache_frames` apply only to frontends that expose those constructor
   parameters today. The Pi0.5 torch RTX/Orin frontend validates
   `vision_pool_factor in {1, 2, 4}`, `vision_num_layers in [1, 27]`, and
   `cache_frames >= 1`.
+- `state_prompt_mode` applies to Pi0.5 RTX/Thor state-in-prompt
+  execution. `"exact"` tracks the exact token length (RTX caches recurring
+  lengths; Thor reuses same-length updates). `"fixed"` captures one max-length
+  graph and masks padded state-prompt tokens with a device-side valid length;
+  use it when live robot state changes make token lengths drift. The default
+  remains `"exact"`, so existing calls keep the exact-length path and the
+  50-step Pi0.5 action graph is unchanged.
+- `state_prompt_fixed_max_len` applies only to Pi0.5 Thor fixed mode. `None`
+  keeps the default 200-token state-prompt cap; serving code can lower it when
+  it knows the live state-prompt bound. The cap must cover the actual token
+  length. On Thor, a close cap such as 120 for a 117-token prompt measured
+  roughly a 1 ms normal overhead versus a warmed exact graph, while larger caps
+  pay for the extra padded tokens. It can also be set with
+  `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
-  BF16 fallback; unsupported frontends ignore it.
-- `use_fp16=True` selects the opt-in Pi0.5 torch RTX SM120/SM89 full-FP16
-  CUDA Graph path. It requires `use_fp8=False` and is currently valid
-  only for `config="pi05"`, `framework="torch"`, and
-  `hardware in {"rtx_sm120", "rtx_sm89"}`.
+  BF16 fallback; unsupported frontends ignore it. GROOT N1.7 on RTX/Thor
+  is stricter: the default route is FP8, and `use_fp8=False` alone
+  raises because there is no separate BF16-only path.
+- `use_fp16=True` selects the opt-in reference path. It requires
+  `use_fp8=False` and is currently valid for:
+  - `config="pi05"`, `framework="torch"`, `hardware in {"rtx_sm120", "rtx_sm89"}`
+  - `config="groot"`, `framework="torch"`, `hardware in {"thor", "rtx_sm120"}`
+  - `config="groot_n17"`, `framework="torch"`,
+    `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`
 - `config="motus"` is a beta RTX SM120 frontend. It expects a Motus
   checkpoint plus Wan and VLM checkpoint paths supplied to the Motus
   quickstart/frontend; see `docs/motus_usage_beta.md`.
@@ -91,9 +113,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   compare_ref=..., return_metadata=...)`, returning the denoised vision
   latent; `predict()` is not part of this API. Precision is selected with
   `load_model(..., use_fp8=True|False)`. See `docs/cosmos3_video_usage.md`.
-- `config="groot_n17"` is registered for `framework="torch"` and
-  `hardware="rtx_sm120"`. This route validates the N1.7 DiT
-  self/cross-attention path on the vendored FA2 backend.
+- `config="groot_n17"` is registered for `framework="torch"` on
+  `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
+  `rtx_sm120` resolves through the historical shared RTX registration and
+  `load_model()` refines that default route to the FP8 production
+  frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
+  `use_fp16=True, use_fp8=False` requests the explicit RTX reference
+  frontend for the selected hardware.
 
 ### `flash_rt.VLAModel`
 
@@ -102,6 +128,14 @@ class VLAModel:
     def set_prompt(self, *args, **kwargs): ...
     def infer(self, *args, **kwargs): ...
     def predict(self, images, prompt=None, state=None) -> np.ndarray: ...
+    def calibrate(
+        self,
+        observations,
+        *,
+        percentile: float = 99.9,
+        max_samples: int | None = None,
+        verbose: bool = False,
+    ) -> None: ...
     def warm_state_prompt_buckets(self, images, prompt, states) -> list[int]: ...
     def recalibrate(self) -> None: ...
 
@@ -141,14 +175,25 @@ class VLAModel:
     convention: normalized in-range values usually become 0..255, while
     values below -1 become -1. RTX/Thor torch frontends and the JAX Thor
     Pi0.5 frontend accept `state` in `set_prompt()` and through `predict()`.
-    Same-length state prompt updates reuse the captured graph; recurring
-    RTX prompt lengths reuse the cached pipeline instead of rebuilding.
+    Same-length state prompt updates reuse the captured graph. RTX exact mode
+    reuses cached recurring prompt lengths; RTX/Thor fixed mode uses one
+    max-length graph for drifting state-token lengths.
   - Pi0-FAST encodes state in the FAST token prefix.
   - GROOT N1.6 consumes proprioceptive state from `obs["state"]`; if omitted,
     the backend uses zeros.
   - GROOT N1.7 currently uses the lower-level
     `normalize_state(...)` + `infer(state_normalized, initial_noise=...)`
     contract rather than the image-list `predict()` contract.
+
+- `calibrate(observations, *, percentile=99.9, max_samples=None,
+  verbose=False)` — run the selected frontend's public calibration path.
+  `observations` may be a single observation dict or an iterable of samples in
+  the frontend's calibration format. `max_samples` caps the consumed sample
+  list before the frontend chooses its N=1 or N>=2 path. Frontends that
+  document N>=2 support run dataset calibration with percentile-clipped amax
+  reduction; unsupported frontends raise a clear `NotImplementedError`.
+  GROOT N1.7 uses captured aux dict samples rather than raw image observation
+  dicts.
 
 - `warm_state_prompt_buckets(images, prompt, states)` — Pi0.5 RTX torch
   helper for realtime loops that pass changing state through the prompt.
@@ -188,8 +233,12 @@ Lazily imports and returns the concrete frontend class for the given
 `(config, framework, arch)` triple. Used internally by `load_model`.
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
-GROOT N1.7 RTX is registered for `(config="groot_n17",
-framework="torch", arch="rtx_sm120")`.
+GROOT N1.7 is registered for `(config="groot_n17", framework="torch",
+arch in {"thor", "rtx_sm120", "rtx_sm89"})`. On RTX, `rtx_sm120`
+keeps the shared-base registration and `load_model()` refines that
+resolved class to the FP8 default or the explicit RTX reference frontend
+based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
+dedicated SM89 frontend class.
 Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
 

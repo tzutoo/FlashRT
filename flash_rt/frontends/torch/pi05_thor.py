@@ -13,6 +13,7 @@ import ctypes
 import json
 import math
 import logging
+import os
 import pathlib
 import time
 from typing import Optional, Union
@@ -83,7 +84,8 @@ class Pi05TorchFrontendThor:
 
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
                  use_cuda_graph: bool = True, autotune: int = 3,
-                 use_fp8: bool = True):
+                 use_fp8: bool = True, state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len: Optional[int] = None):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -91,6 +93,24 @@ class Pi05TorchFrontendThor:
                 Torch usually finds fast graph on trial 0-1.
         """
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        _spm = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE", state_prompt_mode)
+        if _spm not in ("fixed", "exact"):
+            raise ValueError(
+                f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
+        self._state_prompt_mode = _spm
+        _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+        if _spm == "fixed":
+            _fixed_cap = os.environ.get(
+                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+                state_prompt_fixed_max_len)
+            if _fixed_cap is None:
+                _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+            _fixed_cap = int(_fixed_cap)
+            if _fixed_cap <= 0:
+                raise ValueError(
+                    "state_prompt_fixed_max_len must be a positive integer, "
+                    f"got {_fixed_cap}")
+        self._state_prompt_fixed_max_len = _fixed_cap
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
@@ -101,6 +121,8 @@ class Pi05TorchFrontendThor:
         self.calibrated = False
         self.graph_captured = False
         self._real_data_calibrated = False
+        self.current_prompt_len = 0
+        self._fixed_shape_active = False
 
         # ---- RL CFG state (set via set_rl_mode) ----
         # When ``_rl_config`` is non-None, ``set_prompt`` builds an
@@ -932,6 +954,12 @@ class Pi05TorchFrontendThor:
         S_sig = self.sig_S
         nv = self.num_views
 
+        fixed_shape = (
+            self._state_prompt_mode == "fixed"
+            and state is not None
+            and self._rl_config is None
+        )
+
         # ---- Tokenize ----
         if isinstance(prompt_text, (np.ndarray, list)):
             token_ids = np.asarray(prompt_text, dtype=np.int64)
@@ -940,30 +968,71 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            max_len = (self._state_prompt_fixed_max_len
+                       if fixed_shape else PI05_STATE_PROMPT_MAX_LEN)
+            max_len = max_len if state is not None else 48
             embeds, prompt_len = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
 
-        # Se must be EVEN for cuBLASLt FP8
-        Se = S_sig + prompt_len
-        if Se % 2 != 0:
-            Se += 1
-        actual_lang = Se - S_sig
-        if actual_lang > prompt_len:
-            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+        # Se must be EVEN for cuBLASLt FP8. In fixed state-prompt mode the
+        # graph captures the max state-prompt shape and masks padded K/V rows
+        # through the Thor attention backend's device-side seqused buffers.
+        if fixed_shape:
+            Se = S_sig + self._state_prompt_fixed_max_len
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S_sig
+            valid_lang = prompt_len
+            if (S_sig + valid_lang) % 2 != 0:
+                valid_lang += 1
+            if valid_lang > actual_lang:
+                raise ValueError(
+                    f"prompt_len {prompt_len} exceeds fixed state prompt "
+                    f"capacity {actual_lang}")
+            padded = torch.zeros(
+                actual_lang, embeds.shape[1],
+                dtype=embeds.dtype, device=embeds.device)
+            padded[:prompt_len].copy_(embeds)
+            if valid_lang > prompt_len:
+                padded[prompt_len:valid_lang].copy_(embeds[-1:].expand(
+                    valid_lang - prompt_len, -1))
+            embeds = padded
+            valid_prefix = S_sig + valid_lang
+        else:
+            Se = S_sig + prompt_len
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S_sig
+            if actual_lang > prompt_len:
+                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+            valid_prefix = Se
 
         if (self.graph_captured and self._lang_emb is not None
                 and self._S_lang == actual_lang and self.Se == Se):
             self._lang_emb.copy_(embeds)
+            dec_start = valid_prefix if fixed_shape else Se
+            self._dec_rope.copy_(
+                torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
+                           self._ks_t[dec_start:dec_start + self.Sa, :, None]], dim=2)
+                .reshape(self.Sa, 256))
+            self._fixed_shape_active = fixed_shape
+            self.current_prompt_len = int(prompt_len)
+            if self._attn is not None:
+                self._attn.set_fixed_shape(fixed_shape)
+                if fixed_shape:
+                    self._attn.set_fixed_valid_len(valid_prefix)
             logger.info(
                 "Updated Pi0.5 Thor prompt in place: '%s' "
-                "(%d tokens, Se=%d, state=%s)",
-                prompt_text, prompt_len, Se, state is not None)
+                "(%d tokens, Se=%d, state=%s, mode=%s)",
+                prompt_text, prompt_len, Se, state is not None,
+                "fixed" if fixed_shape else "exact")
             return
 
         self.Se = Se
         self.total_keys = Se + self.Sa
+        self._fixed_shape_active = fixed_shape
+        self.current_prompt_len = int(prompt_len)
 
         # Stage 1.4 — build AttentionBackend. total_keys must be set first
         # because the encoder/decoder KV cache layer_stride is computed from
@@ -1004,6 +1073,9 @@ class Pi05TorchFrontendThor:
                 "scale":        attn_scale,
             },
         )
+        self._attn.set_fixed_shape(fixed_shape)
+        if fixed_shape:
+            self._attn.set_fixed_valid_len(valid_prefix)
 
         self._lang_emb = embeds
         self._S_lang = actual_lang
@@ -1012,7 +1084,7 @@ class Pi05TorchFrontendThor:
         self._enc_rope[:Se].copy_(
             torch.cat([self._kc_t[:Se, :, None],
                        self._ks_t[:Se, :, None]], dim=2).reshape(Se, 256))
-        dec_start = Se
+        dec_start = valid_prefix if fixed_shape else Se
         self._dec_rope.copy_(
             torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
                        self._ks_t[dec_start:dec_start + self.Sa, :, None]], dim=2)
@@ -1096,7 +1168,9 @@ class Pi05TorchFrontendThor:
 
         self.graph_captured = True
         self.calibrated = True
-        logger.info("set_prompt done: '%s' (%d tokens, Se=%d)", prompt_text, prompt_len, Se)
+        logger.info("set_prompt done: '%s' (%d tokens, Se=%d, mode=%s)",
+                    prompt_text, prompt_len, Se,
+                    "fixed" if fixed_shape else "exact")
 
     # -----------------------------------------------------------------------
     # Calibration
@@ -1213,6 +1287,7 @@ class Pi05TorchFrontendThor:
             'qw':        self._dec_qkv_flat.data_ptr(),
             'Kc':        self._Kc.reshape(-1).data_ptr(),
             'Vc':        self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':        self._dec_o_flat.data_ptr(),
             'sf':        self._sf_all.data_ptr(),
             'gw':        self._dec_gu_flat.data_ptr(),
@@ -1229,6 +1304,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': self.La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
         }
 
         # Decoder scratch buffers
@@ -1406,6 +1482,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -1423,6 +1500,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
         }
 
         # Warmup
@@ -2248,6 +2326,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -2264,6 +2343,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': self.La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
         }
 
         _ae_calib_buf = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
@@ -2364,6 +2444,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -2380,6 +2461,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
         }
 
         per_sample_enc: list[np.ndarray] = []

@@ -115,7 +115,7 @@ actions = model.predict(
 
 State changes update the prompt embeddings. Because the discretized state is
 rendered into the prompt, its token length drifts with the state values. The
-RTX Pi0.5 frontend offers two strategies via `state_prompt_mode`:
+Pi0.5 RTX/Thor frontends offer two strategies via `state_prompt_mode`:
 
 **`"exact"` (default) — per-length capture + manual warmup.**
 A separate pipeline is captured per exact prompt length and cached, so a
@@ -136,25 +136,25 @@ warmed = model.warm_state_prompt_buckets(
 
 **`"fixed"` (opt-in) — one graph, no warmup.**
 ONE pipeline and ONE captured CUDA Graph at the max prompt length serve every
-length: the padded prefix keys are masked (FlashAttention-2 `seqused_k`) and the
-decoder's action K/V are appended right after the *valid* prefix
-(`qkv_split_rope_devpos`), so a changing state-token length **never re-captures
-a graph or reruns autotune** — no warmup needed. The trade-off is latency:
-every inference runs at the padded max length, so `"fixed"` is ~+1.0 ms (2
-views) / +1.2 ms (3 views) slower than `"exact"` at a typical prompt length
-(measured fp8, RTX 5090; the decoder joint-attention uses a graph-safe
-split-KV kernel that keeps the padding overhead small). That ~1 ms makes
+length: padded prefix keys are masked with a device-side valid length and the
+decoder's action K/V are appended right after the *valid* prefix, so a changing
+state-token length **never re-captures a graph or reruns autotune** — no warmup
+needed. The trade-off is latency: every inference runs at the padded max length.
+On Thor, keeping `state_prompt_fixed_max_len` close to the actual maximum
+(for example 120 for a 117-token prompt) normally costs about 1 ms versus a
+warmed exact graph; larger caps pay for the extra padded tokens. That makes
 `"fixed"` the low-friction choice when the state-token length drifts: zero
 recapture, no length enumeration. Prefer `"exact"` + `warm_state_prompt_buckets()`
 only when you need absolute peak latency at a known, stable set of lengths.
-(Lowering `PI05_STATE_PROMPT_MAX_LEN` toward your real maximum shrinks the
-padding and the gap further.) Enable `"fixed"` like so:
+Enable `"fixed"` like so:
 
 ```python
 model = flash_rt.load_model(
     checkpoint="/path/to/pi05", framework="torch", config="pi05",
-    state_prompt_mode="fixed")
+    state_prompt_mode="fixed",
+    state_prompt_fixed_max_len=120)  # choose a cap >= your observed max
 # or, without code changes: FLASHRT_PI05_STATE_PROMPT_MODE=fixed
+# set FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN=120 to tune the cap in serving
 # predict() handles any state length with a single captured graph
 ```
 
@@ -221,13 +221,14 @@ model = flash_rt.load_model(
 | `use_awq` | `bool` \| `None` | `None` | Activation-aware weight quant. Required for 18-layer FP4 scope (without it, cos collapses to ~0.33). `None` → resolved by the `use_fp4` preset. |
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
 | `use_p1_split_gu` | `bool` \| `None` | `None` | P1 split-GU 2-GEMM path (parity on Pi0.5, kernel reusable for Pi0.6). `None` → resolved by the `use_fp4` preset. |
-| `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for BF16 fallback or for the opt-in Pi0.5 RTX FP16 path. |
-| `use_fp16` | `bool` | `False` | Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Supported: **Pi0.5 / GROOT N1.6 / GROOT N1.7 torch on RTX SM120/SM89**, and **GROOT N1.6 / GROOT N1.7 torch on Thor (SM110)**. Requires `use_fp8=False`; other hardware/configs raise a clear error. See the RTX and Thor full-FP16 sections below. |
+| `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for frontends with a documented BF16 fallback or for explicit full-FP16 reference paths. `groot_n17` on RTX/Thor is stricter: `use_fp8=False` alone raises, and the non-quantized reference path is `use_fp16=True, use_fp8=False`. |
+| `use_fp16` | `bool` | `False` | Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Supported: **Pi0.5 torch on RTX SM120/SM89**, **GROOT N1.6 torch on Thor / RTX SM120**, and **GROOT N1.7 torch on Thor / RTX SM120/SM89**. Requires `use_fp8=False`; other hardware/configs raise a clear error. See the RTX and Thor full-FP16 sections below. |
 | `num_steps` | `int\|None` | `None` | Pi0/Pi0.5 torch frontends. Flow-matching denoise steps; `None` uses the frontend default. |
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
 | `cache_frames` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Temporal encoder K/V cache period; `1` means no temporal reuse. |
-| `state_prompt_mode` | `str` | `"exact"` | Pi0.5 torch RTX. State-in-prompt graph strategy: `"exact"` (per-length capture + `warm_state_prompt_buckets()`) or `"fixed"` (one graph at the max length, no recapture; ~+4.6 ms/2v, +6.7 ms/3v). Env override `FLASHRT_PI05_STATE_PROMPT_MODE`. See [Pi0.5 State Prompts](#pi05-state-prompts). |
+| `state_prompt_mode` | `str` | `"exact"` | Pi0.5 RTX/Thor. State-in-prompt graph strategy: `"exact"` (exact prompt length; RTX can pre-warm recurring buckets) or `"fixed"` (one graph at a configured max length, no recapture). Env override `FLASHRT_PI05_STATE_PROMPT_MODE`. See [Pi0.5 State Prompts](#pi05-state-prompts). |
+| `state_prompt_fixed_max_len` | `int\|None` | `None` | Pi0.5 Thor fixed mode. `None` keeps the default 200-token cap; set a lower cap when serving can bound the state-prompt length. The cap must be >= the actual token length. Env override `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`. |
 
 ### Pi0.5 state prompt bucket warmup
 
@@ -377,7 +378,7 @@ model = flash_rt.load_model(
     "/path/to/GR00T-N1.6-3B",
     framework="torch",
     config="groot",
-    hardware="rtx_sm120",     # or rtx_sm89
+    hardware="rtx_sm120",
     num_views=2,
     embodiment_tag="gr1",
     use_fp8=False,
@@ -393,14 +394,18 @@ production latency.
 #### GROOT N1.7
 
 GROOT N1.7 defaults to the **FP8** path on RTX (see [GROOT N1.7 RTX](#groot-n17-rtx)).
-The full-FP16 variant is the opt-in non-quantized A/B reference: it runs the
-whole backbone (ViT / LLM / VL self-attn) and the action head (state/action
-encoders, the 32-layer DiT, output proj, decoder) through FlashRT kernels in
-FP16, with no PyTorch matmul on the serving feature path.
+The RTX reference variant is the opt-in non-default A/B path:
+
+- on `rtx_sm120`, it is the existing `GrootN17TorchFrontendRtxFP16`
+- on `rtx_sm89`, it is the dedicated
+  `GrootN17TorchFrontendRtxSm89FP16`
+
+Both paths replace the default FP8 route selected by `load_model()`, but the
+exact kernel/dtype mix remains hardware-specific.
 
 N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
 contract (not the `predict(images=...)` quickstart flow), so construct the
-frontend directly:
+frontend directly when you want the explicit class. Example for `rtx_sm120`:
 
 ```python
 from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
@@ -416,14 +421,22 @@ fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing p
 actions = fe.infer(state_normalized, initial_noise=noise)
 ```
 
+On `rtx_sm89`, import and construct
+`flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16.GrootN17TorchFrontendRtxSm89FP16`
+instead.
+
 `load_model(config="groot_n17", hardware="rtx_sm120", use_fp16=True,
-use_fp8=False)` returns this frontend. Reference on RTX 5090: FP16-vs-bf16
+use_fp8=False)` returns this frontend; on `hardware="rtx_sm89"` the same API
+returns the dedicated `GrootN17TorchFrontendRtxSm89FP16` reference frontend.
+Reference on RTX 5090: FP16-vs-bf16
 action cosine ≈ 0.99999, combined E2E-vs-reference cosine ≈ 0.9999; infer
 latency ≈ 10.7 ms (≈ the bf16 path — the DiT GEMMs are small, so FP16 and bf16
 throughput match).
 
-The underlying FP16 kernels are SM80-family friendly; FlashRT exposes the
-FP16 route for Pi0.5, GROOT N1.6, and GROOT N1.7 on the RTX frontends.
+The underlying FP16 kernels are SM80-family friendly, but the public support
+matrix is narrower: FlashRT exposes the FP16 RTX route for Pi0.5 on
+`rtx_sm120` / `rtx_sm89`, for GROOT N1.6 on `rtx_sm120`, and for GROOT N1.7
+on `rtx_sm120` / `rtx_sm89`.
 
 ### Thor non-FP8 reference paths (GROOT N1.6 / N1.7)
 
@@ -531,13 +544,22 @@ embeddings, visual masks, M-RoPE tables, pixel features, and `grid_thw`.
 `infer()` expects normalized state and returns normalized actions;
 denormalization remains the caller's responsibility for this N1.7 path.
 
-On RTX the default path is **FP8**: the backbone GEMMs (ViT / LLM / VL
-self-attn) run FP8 via the SM120-safe descale pattern (`fp8_descale_fp16` plus
-separate bias/GELU — the fused cuBLAS FP8 epilogue is unsupported on sm_120),
-and the bf16 DiT runs in `infer`. The entire forward runs through FlashRT
-kernels: backbone attention uses the vendored FA2 / FMHA kernels in
-`set_prompt`, and DiT self/cross attention uses FlashRT's vendored FA2 slots
-during `infer`. No PyTorch matmul runs on the serving feature path.
+On RTX the default path is **FP8**, but the hardware split is explicit:
+
+- `rtx_sm120` uses the shared RTX frontend / pipeline with the established
+  `fp8_descale_fp16` backbone path
+- `rtx_sm89` uses a dedicated RTX SM89 frontend / pipeline with runtime
+  weights stored as `[N, K]` and GEMMs dispatched through `fp8_nt_dev`
+
+In both cases the VLM backbone feature path runs through FlashRT kernels:
+backbone attention uses the vendored FA2 / FMHA kernels in `set_prompt`, and
+DiT self/cross attention uses FlashRT's vendored FA2 slots during `infer`.
+The action-head mix is not identical across the two RTX families:
+
+- `rtx_sm120` keeps the established RTX semantics documented by its frontend
+- `rtx_sm89` keeps FlashRT kernel execution for the SM89 FP8 backbone and
+  quantized DiT hot-path GEMMs, while some action-head-adjacent helpers stay
+  in the inherited bf16/fp16 route
 
 Activation scales follow the FlashRT calibration convention
 ([Calibration](#calibration)): weight scales are baked at load, activation
@@ -547,9 +569,11 @@ the cache and runs FP8 kernels only; the torch reference shadow runs solely on
 a cold cache miss (or `recalibrate=True`) to extract activation amax — never as
 the inference backbone. `calibrate(aux_list)` refines scales across N samples.
 
-Supported hardware is `rtx_sm120` (RTX 5090-class Blackwell). SM89 is
-registered through the same path; validate benchmark/accuracy on the target
-card.
+Supported hardware is `rtx_sm120` and `rtx_sm89`. `rtx_sm120` remains the
+validated Blackwell reference path in the public docs; `rtx_sm89` is validated
+locally on RTX 4090 using the same aux/reference-fixture methodology and
+should still be benchmarked on the target card before making hardware-specific
+claims.
 
 Build FA2 with at least the N1.7 head dimensions and dtypes:
 
@@ -813,6 +837,26 @@ CUDA Graph instantiation on Thor is non-deterministic — the same kernels can p
 
 Autotune is part of `set_prompt()`. If you call `predict()` with the same prompt, the cached graph is replayed — no autotune overhead.
 
+### RTX 4090 / SM89 FP8 NT safety policy
+
+Pi0.5 on RTX 4090 / Ada uses FP8 weights in `nk` layout and dispatches
+cuBLASLt FP8 NT GEMMs. On some SM89 driver / cuBLASLt runtime combinations,
+the default heuristic top-1 algorithm is stable but the top-N autotune
+benchmark can expose a non-default candidate that raises CUDA illegal memory
+access. Because that failure poisons the CUDA context, FlashRT avoids the risky
+benchmark path before it runs.
+
+By default (`FLASHRT_FP8_NT_AUTOTUNE=auto`), Pi0.5 skips FP8 NT top-N autotune
+on SM89 and keeps the cuBLASLt heuristic top-1 algorithm. FP8 inference remains
+enabled; only the FP8 NT autotune benchmark is skipped.
+
+Override for debugging / local benchmarking:
+
+```bash
+FLASHRT_FP8_NT_AUTOTUNE=force  # force FP8 NT top-N autotune
+FLASHRT_FP8_NT_AUTOTUNE=safe   # always skip FP8 NT top-N autotune
+```
+
 ---
 
 ## Calibration
@@ -985,19 +1029,14 @@ scales for free.
 | `pi05_thor_fp4` (jax, FP4 encoder active) | ✅ | ✅ (two-phase: FP8 + AWQ refit) |
 | `pi0_rtx`, `pi05_rtx` (torch + jax) | ✅ | ✅ |
 | `groot_rtx` (torch) | ✅ | ✅ |
-| `groot_thor` (torch) | ✅ | ❌ (see note) |
-| `pi05_thor` / `pi0_thor` / `pi0fast` (jax, non-FP4) | ✅ | ❌ (see note) |
+| `groot_n17_thor` (torch, aux samples) | ✅ | ✅ |
+| `groot_thor` (torch) | ✅ | Implemented; validate with N1.6 fixtures before deployment |
+| `pi05_thor` / `pi0_thor` / `pi0fast` (jax, non-FP4) | ✅ | Implemented; validate with target fixtures before deployment |
 
-Frontends marked ❌ raise `NotImplementedError` on N >= 2 — pass N = 1
-there today. Reasons:
-
-- **`groot_thor`**: the Thor port of the multi-sample path is staged
-  for the next rollout; the N=1 calibrate path remains the default
-  there. RTX (`groot_rtx`) ships the full N>=2 path today.
-- Non-FP4 JAX Thor frontends (`pi05_thor`, `pi0_thor`, `pi0fast`): the
-  FP8-only JAX path still uses the N=1 implicit-recalibrate shim; the
-  JAX Pi0.5 FP4 frontend (`pi05_thor_fp4` with `framework="jax"`) does
-  support N>=2, using the same two-phase flow as torch.
+GROOT N1.7 Thor is aux-driven rather than `predict()`-driven: its
+calibration samples use the same aux schema consumed by
+`set_prompt(aux=...)`. The obs-list examples above apply to
+`predict()`-style frontends.
 
 `pi05_thor_fp4` uses a two-phase multi-sample flow: Phase 1 reduces
 FP8 activation scales across N samples (same loop the base class
@@ -1346,10 +1385,9 @@ Max-perf mode is ~1.5s (decode graph capture dominates after cache hit).
 ## NVFP4 (Pi0.5 only)
 
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5
-encoder FFN stack, enabled via a single flag `use_fp4=True`. **Currently
-only supported on Pi0.5 torch.** The gate applies in two directions:
-- Other configs (`pi0` / `groot` / `pi0fast`) log a warning and fall back to FP8.
-- `framework="jax"` with `use_fp4=True` also logs a warning and falls back to FP8, even with `config="pi05"` — JAX FP4 is not yet wired up (planned, see handoff prompt Task A).
+encoder FFN stack, enabled via a single flag `use_fp4=True`. It is supported
+for **Pi0.5 torch and JAX on Thor**. Other configs (`pi0` / `groot` /
+`pi0fast`) log a warning and use the FP8 route.
 
 ```python
 # Production-recommended — single flag, best-known config:
@@ -1411,14 +1449,16 @@ When `use_fp4=True` and a sub-flag (`fp4_layers`, `use_awq`,
 ### Weight loading
 
 When `use_fp4=True`, the FP4 layer weights are loaded directly as fp16 from
-safetensors and NVFP4-quantized offline (no FP8 intermediate). This matches
-the NVIDIA modelopt design and avoids a double-lossy FP8 → fp16 → FP4
-round-trip. A fp8-dequant fallback path exists if direct fp16 load fails.
+the selected framework checkpoint and NVFP4-quantized offline (no FP8
+intermediate). Torch uses safetensors checkpoints. JAX uses Orbax checkpoints
+and depends on the Orbax loader accepting current `StepMetadata` checkpoint
+metadata. This matches the NVIDIA modelopt design and avoids a double-lossy
+FP8 → fp16 → FP4 round-trip.
 
 ### Requirements
 
 - SM100+ GPU with Blackwell Tensor Cores (validated on Thor SM110).
-  Hardware without NVFP4 support silently falls back to FP8.
+  Hardware without NVFP4 support logs a warning and uses the FP8 route.
 - `flash_rt_fp4.so` extension built alongside `flash_rt_kernels.so`
   (automatic in standard install).
 
@@ -1447,6 +1487,20 @@ Multi-model precision regression (`tests/test_all_models_precision.py`):
 | Pi0 | (unchanged) | vs_pytorch_ref=0.9972 | 46.7 ms |
 | Pi0 JAX | (unchanged) | vs_pytorch_ref=0.9983 | 45.1 ms |
 | GROOT N1.6 | (unchanged) | vs_pytorch_ref=0.9986 | 46.2 ms |
+
+Thor replay-latency / precision check for the JAX Orbax path:
+
+| Frontend | Views | P50 | P95 | cos vs same-origin PyTorch ref | max diff |
+|---|---:|---:|---:|---:|---:|
+| `jax_fp8` | 3 | 55.03 ms | 55.23 ms | 0.999358 | 0.0638 |
+| `jax_fp4` | 3 | 50.30 ms | 56.58 ms | 0.998351 | 0.0994 |
+
+The JAX reference was generated from the same `pi05_libero_jax` Orbax
+checkpoint via the upstream OpenPI conversion script and
+`PI0Pytorch.sample_actions`; do not compare this validation against a separate
+HF / LeRobot safetensors checkpoint. These numbers are correctness /
+availability evidence for the Thor JAX FP4 path, not a broad performance
+claim.
 
 ### Layer selection
 

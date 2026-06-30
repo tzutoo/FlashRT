@@ -261,6 +261,10 @@ class Qwen3TorchFrontendRtx:
         self._last_hidden_buf = torch.empty(
             1, Sq_max, hidden, device=device, dtype=bf16,
         )
+        # Prefill embedding-lookup output (kernel gather, no torch index).
+        self._embed_h_buf = torch.empty(
+            Sq_max, hidden, device=device, dtype=bf16,
+        )
 
         # Static decode-step scratch: a (1, 1) long tensor holding the
         # next token id, copy_'d in place every step so CUDA graph
@@ -293,6 +297,31 @@ class Qwen3TorchFrontendRtx:
         # ON.
         self._enable_qkv_post_fusion: bool = True
 
+        # Prefill (M=S) batched q/k/v post-proc fusion: collapse the
+        # per-layer (q_norm + k_norm + 2× RoPE + Q/K/V copies) chain into
+        # two batched launches via `qwen3_q_norm_rope_qstage_prefill_bf16`
+        # / `qwen3_k_norm_rope_kvwrite_prefill_bf16`, reading the strided
+        # q/k/v slices of the fused QKV output in place. Requires the
+        # fused QKV path (homogeneous alpha). Default ON.
+        self._enable_qkv_post_fusion_prefill: bool = True
+
+        # Prefill boundary fusion: fold residual_2 + next-layer input_norm
+        # + nvfp4 quant into one `residual_add_rms_norm_to_nvfp4` per layer
+        # boundary (mirrors the decode `_enable_boundary_fusion`), removing
+        # the standalone torch.add + a separate input norm+quant. Default ON.
+        self._enable_boundary_fusion_prefill: bool = True
+
+        # FP8 (e4m3) lm_head for the prefill eager M=1 path. The bf16
+        # lm_head is bandwidth-bound on the 1.24 GB weight (~0.76 ms);
+        # W8A8 fp8 halves that read. Per-call activation scale keeps the
+        # next-token argmax matching the original HF bf16 ref as well as
+        # the bf16 lm_head (24-prompt check: 3 vs HF, == bf16's 4). Only
+        # the M=1 (full_logits=False) path; full_logits stays bf16.
+        # Default ON when the fp8 weight is present.
+        self._enable_lmhead_fp8_prefill: bool = True
+        self._lmhead_fp8_act = None     # [hidden] fp8 activation buffer
+        self._lmhead_act_scale = None   # [1] f32 device amax scale
+
         # silu_mul + nvfp4 quant fusion: collapse `silu(gate) * up`
         # and the subsequent nvfp4 swizzled quantization into one
         # launch (`silu_mul_to_nvfp4_swizzled_bf16`); also avoids a
@@ -309,8 +338,15 @@ class Qwen3TorchFrontendRtx:
             self._qkv_fused_out = torch.empty(
                 1, qkv_N, device=device, dtype=bf16,
             )
+            # Prefill (M=S) fused-QKV output; folds the two N=1024 k/v
+            # GEMMs (~21% of FP4 peak each at M=512) into one wide-N
+            # GEMM with q. Sized to the largest prefill bucket.
+            self._qkv_prefill_out = torch.empty(
+                Sq_max, qkv_N, device=device, dtype=bf16,
+            )
         else:
             self._qkv_fused_out = None
+            self._qkv_prefill_out = None
         if layers0.get('gate_up_homogeneous_alpha'):
             gu_N = int(layers0['gate_up_N'])
             self._gate_up_fused_out = torch.empty(
@@ -893,7 +929,7 @@ class Qwen3TorchFrontendRtx:
         # BW saving justifies. Reverted to BF16. A future NVFP4
         # lm_head with FP8 per-row calibration could potentially
         # recover the gap.
-        fvk.bf16_matmul_qwen36_bf16(
+        fvk.bf16_matmul_bf16(
             x_norm.data_ptr(),
             int(self._weights.ptrs['lm_head_w']),
             self._logits_buf[:1].data_ptr(),
@@ -904,7 +940,10 @@ class Qwen3TorchFrontendRtx:
     # ── D4: S=N prefill ──
 
     def _layer_forward_full_nvfp4_prefill(self, L: int, h_in_S, cos_S,
-                                            sin_S, start_pos: int, S: int):
+                                            sin_S, start_pos: int, S: int,
+                                            prequant_ap=None, prequant_sf=None,
+                                            next_input_norm_w: int = 0,
+                                            final_norm_w: int = 0):
         """Single Qwen3 layer at S=N prefill.
 
         Same kernel sequence as ``_layer_forward_full_nvfp4`` but with
@@ -937,80 +976,143 @@ class Qwen3TorchFrontendRtx:
 
         h2 = h_in_S.view(S, hidden).contiguous()
 
-        # 1+2) input layernorm + NVFP4 quantize at M=S.
+        # 1+2) input layernorm + NVFP4 quantize at M=S. With boundary
+        # fusion the previous layer's tail already produced this layer's
+        # pre-quantized activation (residual_2 + this input_norm + quant
+        # in one launch), so skip the standalone norm+quant here.
         ap_h, sf_h, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-        fvk.rms_norm_to_nvfp4_swizzled_bf16(
-            h2.data_ptr(), int(lw['input_norm_w']),
-            ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
-        )
+        if prequant_ap is not None and prequant_sf is not None:
+            ap_h, sf_h = prequant_ap, prequant_sf
+        else:
+            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+                h2.data_ptr(), int(lw['input_norm_w']),
+                ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
+            )
 
-        # 3) q/k/v_proj NVFP4 GEMMs at M=S.
+        # 3) q/k/v_proj NVFP4 GEMMs at M=S. When the checkpoint has a
+        # homogeneous qkv alpha (q/k/v share activation + alpha) a single
+        # fused N=6144 GEMM via `qkv_proj_packed` replaces q (N=4096) plus
+        # the two N=1024 k/v GEMMs — each of which runs at only ~21% of
+        # FP4 peak at M=512. Folding them into the wide-N GEMM lifts the
+        # whole projection toward the q_proj/down efficiency band.
         prefill_gemm = self._prefill_gemm
-        q_proj_out_buf = self._nvfp4_scratch[(n_q * hd, hidden)][2]
-        prefill_gemm(
-            ap_h.data_ptr(), int(lw['q_proj_packed']),
-            q_proj_out_buf.data_ptr(),
-            S, n_q * hd, hidden,
-            sf_h.data_ptr(), int(lw['q_proj_sf']),
-            float(lw['q_proj_alpha']),
-            s,
-        )
-        kv_proj_out_buf = self._nvfp4_scratch[(n_kv * hd, hidden)][2]
-        prefill_gemm(
-            ap_h.data_ptr(), int(lw['k_proj_packed']),
-            kv_proj_out_buf.data_ptr(),
-            S, n_kv * hd, hidden,
-            sf_h.data_ptr(), int(lw['k_proj_sf']),
-            float(lw['k_proj_alpha']),
-            s,
-        )
-        q_pre = q_proj_out_buf[:S].view(1, S, n_q, hd)
-        k_pre = kv_proj_out_buf[:S].view(1, S, n_kv, hd).contiguous()
+        # When the fused QKV path is active, the batched post-proc kernel
+        # consumes the strided q/k/v slices of qkv_out in place (no
+        # contiguous copy) and writes Q_buf/K_cache/V_cache directly.
+        use_fused_post = (self._qkv_prefill_out is not None
+                          and self._enable_qkv_post_fusion_prefill)
+        if self._qkv_prefill_out is not None:
+            qkv_N = int(lw['qkv_proj_N'])
+            Nq = n_q * hd          # 4096
+            Nk = n_kv * hd         # 1024
+            qkv_out = self._qkv_prefill_out[:S]
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['qkv_proj_packed']),
+                qkv_out.data_ptr(),
+                S, qkv_N, hidden,
+                sf_h.data_ptr(), int(lw['qkv_proj_sf']),
+                float(lw['qkv_proj_alpha']),
+                s,
+            )
+            if not use_fused_post:
+                q_pre = qkv_out[:, :Nq].view(1, S, n_q, hd)
+                k_pre = qkv_out[:, Nq:Nq + Nk].view(1, S, n_kv, hd).contiguous()
+                v_fused = qkv_out[:, Nq + Nk:].view(S, n_kv, hd)
+        else:
+            q_proj_out_buf = self._nvfp4_scratch[(n_q * hd, hidden)][2]
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['q_proj_packed']),
+                q_proj_out_buf.data_ptr(),
+                S, n_q * hd, hidden,
+                sf_h.data_ptr(), int(lw['q_proj_sf']),
+                float(lw['q_proj_alpha']),
+                s,
+            )
+            kv_proj_out_buf = self._nvfp4_scratch[(n_kv * hd, hidden)][2]
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['k_proj_packed']),
+                kv_proj_out_buf.data_ptr(),
+                S, n_kv * hd, hidden,
+                sf_h.data_ptr(), int(lw['k_proj_sf']),
+                float(lw['k_proj_alpha']),
+                s,
+            )
+            q_pre = q_proj_out_buf[:S].view(1, S, n_q, hd)
+            k_pre = kv_proj_out_buf[:S].view(1, S, n_kv, hd).contiguous()
+            v_fused = None
 
-        # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
-        q_pre_flat = q_pre.contiguous().view(S * n_q, hd)
-        k_pre_flat = k_pre.view(S * n_kv, hd)
-        fvk.rms_norm(
-            q_pre_flat.data_ptr(), int(lw['q_norm_w']),
-            self._q_norm_out[:S * n_q].data_ptr(), S * n_q, hd, eps, s,
-        )
-        fvk.rms_norm(
-            k_pre_flat.data_ptr(), int(lw['k_norm_w']),
-            self._k_norm_out[:S * n_kv].data_ptr(), S * n_kv, hd, eps, s,
-        )
+        if use_fused_post:
+            # 4+5+6+7) Fused batched q/k/v post-proc: two launches replace
+            # rms_norm ×2 + multi-op RoPE ×2 + Q/K/V copies. Reads the
+            # strided q/k/v slices of qkv_out in place (in_row_stride =
+            # qkv_N) and writes Q_buf / K_cache / V_cache for all S rows.
+            kv_row_elems = n_kv * hd
+            kv_off = (L * self._attn.kv_layer_stride_bytes
+                      + start_pos * self._attn.kv_row_stride_bytes)
+            k_cache_dst = self._attn.K_cache.data_ptr() + kv_off
+            v_cache_dst = self._attn.V_cache.data_ptr() + kv_off
+            fvk.qwen3_q_norm_rope_qstage_prefill_bf16(
+                qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                cos_S.data_ptr(), sin_S.data_ptr(),
+                self._attn.Q_buf[:, :S].data_ptr(),
+                n_q, S, qkv_N, n_q * hd, eps, s,
+            )
+            fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16(
+                qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                cos_S.data_ptr(), sin_S.data_ptr(),
+                k_cache_dst, v_cache_dst,
+                n_kv, S, qkv_N, kv_row_elems, eps, s,
+            )
+        else:
+            # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
+            q_pre_flat = q_pre.contiguous().view(S * n_q, hd)
+            k_pre_flat = k_pre.view(S * n_kv, hd)
+            fvk.rms_norm(
+                q_pre_flat.data_ptr(), int(lw['q_norm_w']),
+                self._q_norm_out[:S * n_q].data_ptr(), S * n_q, hd, eps, s,
+            )
+            fvk.rms_norm(
+                k_pre_flat.data_ptr(), int(lw['k_norm_w']),
+                self._k_norm_out[:S * n_kv].data_ptr(), S * n_kv, hd, eps, s,
+            )
 
-        # 5) Inline full-RoPE (rotary_dim = head_dim).
-        q_for_rope = self._q_norm_out[:S * n_q].view(1, S, n_q, hd)
-        k_for_rope = self._k_norm_out[:S * n_kv].view(1, S, n_kv, hd)
-        # cos_S/sin_S are (S, hd/2). Broadcast to (1, S, 1, hd/2).
-        cos4 = cos_S.view(1, S, 1, hd // 2)
-        sin4 = sin_S.view(1, S, 1, hd // 2)
-        q_rot = self._q_rot[:, :S]
-        k_rot = self._k_rot[:, :S]
-        self._rope_apply_inline(
-            q_for_rope, q_rot, self._rope_tmp_q[:, :S], cos4, sin4,
-        )
-        self._rope_apply_inline(
-            k_for_rope, k_rot, self._rope_tmp_k[:, :S], cos4, sin4,
-        )
+            # 5) Inline full-RoPE (rotary_dim = head_dim).
+            q_for_rope = self._q_norm_out[:S * n_q].view(1, S, n_q, hd)
+            k_for_rope = self._k_norm_out[:S * n_kv].view(1, S, n_kv, hd)
+            # cos_S/sin_S are (S, hd/2). Broadcast to (1, S, 1, hd/2).
+            cos4 = cos_S.view(1, S, 1, hd // 2)
+            sin4 = sin_S.view(1, S, 1, hd // 2)
+            q_rot = self._q_rot[:, :S]
+            k_rot = self._k_rot[:, :S]
+            self._rope_apply_inline(
+                q_for_rope, q_rot, self._rope_tmp_q[:, :S], cos4, sin4,
+            )
+            self._rope_apply_inline(
+                k_for_rope, k_rot, self._rope_tmp_k[:, :S], cos4, sin4,
+            )
 
-        # 6) Stage Q + write K to KV cache at [start_pos:start_pos+S].
-        self._attn.Q_buf[:, :S].copy_(q_rot)
-        self._attn.K_cache[L, start_pos:start_pos + S].copy_(
-            k_rot.view(S, n_kv, hd),
-        )
+            # 6) Stage Q + write K to KV cache at [start_pos:start_pos+S].
+            self._attn.Q_buf[:, :S].copy_(q_rot)
+            self._attn.K_cache[L, start_pos:start_pos + S].copy_(
+                k_rot.view(S, n_kv, hd),
+            )
 
-        # 7) v_proj — reuse kv_proj_out_buf, write into V_cache.
-        prefill_gemm(
-            ap_h.data_ptr(), int(lw['v_proj_packed']),
-            kv_proj_out_buf.data_ptr(),
-            S, n_kv * hd, hidden,
-            sf_h.data_ptr(), int(lw['v_proj_sf']),
-            float(lw['v_proj_alpha']),
-            s,
-        )
-        v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
-        self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
+            # 7) v_proj — the fused QKV path produced v inside the qkv
+            # slice; the split path runs the v GEMM now (reusing kv buf).
+            if v_fused is not None:
+                v_new = v_fused
+            else:
+                prefill_gemm(
+                    ap_h.data_ptr(), int(lw['v_proj_packed']),
+                    kv_proj_out_buf.data_ptr(),
+                    S, n_kv * hd, hidden,
+                    sf_h.data_ptr(), int(lw['v_proj_sf']),
+                    float(lw['v_proj_alpha']),
+                    s,
+                )
+                v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
+            self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
 
         # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S.
         kv_seq = start_pos + S
@@ -1103,11 +1205,74 @@ class Qwen3TorchFrontendRtx:
         )
         mlp_out = down_out_buf[:S].view(1, S, hidden)
 
-        # 15) Residual 2 → ping-pong.
+        # 15) Residual 2 (+ optional boundary / final-norm fusion).
+        if final_norm_w:
+            # Last layer: fuse residual_2 + the final RMSNorm (bf16)
+            # straight into the persistent last-hidden buffer — kills the
+            # trailing torch.add AND the standalone final rms_norm.
+            x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
+            fvk.residual_add_rms_norm(
+                h_post.data_ptr(), mlp_out.contiguous().data_ptr(),
+                int(final_norm_w), x_norm.data_ptr(), S, hidden, eps, s,
+            )
+            return None
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
         h_out_v = h_out[:, :S]
-        torch.add(h_post, mlp_out, out=h_out_v)
+        if next_input_norm_w:
+            # Fused: h_out = h_post + mlp_out AND next ap/sf =
+            # nvfp4_quant(rms_norm(h_out, next_norm_w)). Reuse the
+            # (n_q*hd, hidden) NVFP4 scratch — consumer-done by step 3.
+            next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+                h_post.data_ptr(), mlp_out.contiguous().data_ptr(),
+                h_out_v.data_ptr(), int(next_input_norm_w),
+                next_ap.data_ptr(), next_sf.data_ptr(), S, hidden, eps, s,
+            )
+        else:
+            torch.add(h_post, mlp_out, out=h_out_v)
         return h_out_v
+
+    def _lm_head_m1(self, last_row, vocab: int, hidden: int, s) -> None:
+        """Eager M=1 lm_head into self._logits_buf[:1]. Uses the W8A8 fp8
+        GEMV (half the bf16 weight BW) with a per-call activation scale when
+        the fp8 weight is present and enabled; else the bf16 mat-vec. The
+        fp8 path matches the original HF bf16 next-token argmax as well as
+        the bf16 lm_head (validated 24 prompts). Eager only (prefill tail);
+        decode keeps the captured bf16 lm_head."""
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+        lm_fp8 = self._weights.ptrs.get('lm_head_fp8')
+        if self._enable_lmhead_fp8_prefill and lm_fp8 is not None:
+            # Pure-kernel activation quant: quantize_fp8_device does the
+            # amax + e4m3 quant in one launch (replacing the torch abs/max/
+            # mul/clamp/cast chain). d_scale = amax/448; dequant = fp8 *
+            # d_scale, so the GEMV alpha = act_dscale * weight_dscale =
+            # act_dscale / lm_head_fp8_wscale.
+            if self._lmhead_fp8_act is None:
+                dev = self._logits_buf.device
+                self._lmhead_fp8_act = torch.empty(
+                    hidden, device=dev, dtype=torch.float8_e4m3fn)
+                self._lmhead_act_scale = torch.empty(
+                    1, device=dev, dtype=torch.float32)
+            lr = last_row.reshape(hidden).contiguous()
+            fvk.quantize_fp8_device(
+                lr.data_ptr(), self._lmhead_fp8_act.data_ptr(),
+                self._lmhead_act_scale.data_ptr(), hidden, s)
+            # Device-scale GEMV: alpha = act_scale[0] * w_descale is read
+            # on-device, so the per-call activation scale never round-trips
+            # to the host (no sync — the hot path stays kernel-only).
+            w_descale = 1.0 / self._weights.ptrs['lm_head_fp8_wscale']
+            fvk.ht_gemv_fp8_m1_w16_dscale(
+                self._lmhead_fp8_act.data_ptr(), int(lm_fp8),
+                self._logits_buf[:1].data_ptr(), 1, vocab, hidden,
+                self._lmhead_act_scale.data_ptr(), w_descale, s,
+            )
+        else:
+            fvk.bf16_matmul_bf16(
+                last_row.contiguous().data_ptr(),
+                int(self._weights.ptrs['lm_head_w']),
+                self._logits_buf[:1].data_ptr(), 1, vocab, hidden, s,
+            )
 
     def forward_prefill_nvfp4(self, prompt_ids, start_pos: int = 0,
                                 *, full_logits: bool = False):
@@ -1162,11 +1327,14 @@ class Qwen3TorchFrontendRtx:
                 f'prefill end {start_pos + S} > max_seq {self.max_seq}'
             )
 
-        # 0) Embed S tokens.
+        # 0) Embed S tokens via the kernel gather (no torch indexing).
         embed_t = self._weights.anchors[0]
-        h = embed_t[prompt_ids.view(-1)].view(1, S, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        h = self._embed_h_buf[:S]
+        fvk.embedding_lookup_bf16(
+            prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
+            h.data_ptr(), S, hidden, s,
+        )
+        h = h.view(1, S, hidden)
 
         # 1) cos/sin for absolute positions [start_pos, start_pos+S).
         cos_S = self._rope_cos_table[start_pos:start_pos + S]
@@ -1175,23 +1343,55 @@ class Qwen3TorchFrontendRtx:
 
         # 2) 36 layers.
         n_layers = cfg['num_hidden_layers']
-        for L in range(n_layers):
-            h = self._layer_forward_full_nvfp4_prefill(
-                L, h, cos_S, sin_S, start_pos, S,
+        layers_ptrs = self._weights.ptrs['layers']
+        if self._enable_boundary_fusion_prefill:
+            # Pre-quant the layer-0 input, then have each layer's tail
+            # produce the next layer's pre-quant via the fused
+            # residual+norm+quant op. Removes the standalone torch.add
+            # (residual_2) + a separate input norm+quant per boundary.
+            n_q = cfg['num_q_heads']
+            hd = cfg['head_dim']
+            ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            h0_v = h.view(S, hidden).contiguous()
+            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+                h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
+                ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
+            final_w = int(self._weights.ptrs['final_norm_w'])
+            for L in range(n_layers):
+                last = L + 1 == n_layers
+                next_w = 0 if last else int(layers_ptrs[L + 1]['input_norm_w'])
+                # Last layer fuses residual_2 + final RMSNorm into
+                # _last_hidden_buf; earlier layers fuse into the next
+                # layer's pre-quant.
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, start_pos, S,
+                    prequant_ap=ap0, prequant_sf=sf0,
+                    next_input_norm_w=next_w,
+                    final_norm_w=(final_w if last else 0),
+                )
+            final_done = True
+        else:
+            for L in range(n_layers):
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, start_pos, S,
+                )
+            final_done = False
 
-        # 3) Final RMSNorm at M=S.
-        h2 = h.view(S, hidden).contiguous()
-        x_norm = self._h_b[:S].view(S, hidden)
-        fvk.rms_norm(
-            h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
-            x_norm.data_ptr(), S, hidden, eps, s,
-        )
-        self._last_hidden_buf[:, :S].copy_(x_norm.view(1, S, hidden))
+        # 3) Final RMSNorm at M=S, written straight into the persistent
+        # last-hidden buffer (no separate stage-copy). With boundary
+        # fusion the last layer already fused residual_2 + final norm.
+        x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
+        if not final_done:
+            h2 = h.view(S, hidden).contiguous()
+            fvk.rms_norm(
+                h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
+                x_norm.data_ptr(), S, hidden, eps, s,
+            )
 
         # 4) lm_head BF16. M=1 (last row, default) or M=S (full_logits).
         if full_logits:
-            fvk.bf16_matmul_qwen36_bf16(
+            fvk.bf16_matmul_bf16(
                 x_norm.contiguous().data_ptr(),
                 int(self._weights.ptrs['lm_head_w']),
                 self._logits_buf[:S].data_ptr(),
@@ -1200,12 +1400,7 @@ class Qwen3TorchFrontendRtx:
             ret = self._logits_buf[:S]
         else:
             last_row = x_norm[S - 1:S].contiguous()
-            fvk.bf16_matmul_qwen36_bf16(
-                last_row.data_ptr(),
-                int(self._weights.ptrs['lm_head_w']),
-                self._logits_buf[:1].data_ptr(),
-                1, vocab, hidden, s,
-            )
+            self._lm_head_m1(last_row, vocab, hidden, s)
             ret = self._logits_buf[:1]
 
         # Advance the logical decode cursor to right after the prompt.
@@ -1322,26 +1517,54 @@ class Qwen3TorchFrontendRtx:
         eps = float(cfg['rms_norm_eps'])
 
         embed_t = self._weights.anchors[0]
-        h = embed_t[prompt_ids.view(-1)].view(1, S, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        h = self._embed_h_buf[:S]
+        fvk.embedding_lookup_bf16(
+            prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
+            h.data_ptr(), S, hidden, s,
+        )
+        h = h.view(1, S, hidden)
 
         cos_S = self._rope_cos_table[0:S]
         sin_S = self._rope_sin_table[0:S]
 
         n_layers = cfg['num_hidden_layers']
-        for L in range(n_layers):
-            h = self._layer_forward_full_nvfp4_prefill(
-                L, h, cos_S, sin_S, 0, S,
+        layers_ptrs = self._weights.ptrs['layers']
+        if self._enable_boundary_fusion_prefill:
+            n_q = cfg['num_q_heads']
+            hd = cfg['head_dim']
+            ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            h0_v = h.view(S, hidden).contiguous()
+            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+                h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
+                ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
+            final_w = int(self._weights.ptrs['final_norm_w'])
+            for L in range(n_layers):
+                last = L + 1 == n_layers
+                next_w = 0 if last else int(layers_ptrs[L + 1]['input_norm_w'])
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, 0, S,
+                    prequant_ap=ap0, prequant_sf=sf0,
+                    next_input_norm_w=next_w,
+                    final_norm_w=(final_w if last else 0),
+                )
+            final_done = True
+        else:
+            for L in range(n_layers):
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, 0, S,
+                )
+            final_done = False
 
-        h2 = h.view(S, hidden).contiguous()
-        x_norm = self._h_b[:S].view(S, hidden)
-        fvk.rms_norm(
-            h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
-            x_norm.data_ptr(), S, hidden, eps, s,
-        )
-        self._last_hidden_buf[:, :S].copy_(x_norm.view(1, S, hidden))
+        # Final RMSNorm straight into _last_hidden_buf (boundary fusion
+        # already fused it into the last layer).
+        if not final_done:
+            h2 = h.view(S, hidden).contiguous()
+            x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
+            fvk.rms_norm(
+                h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
+                x_norm.data_ptr(), S, hidden, eps, s,
+            )
 
     def _ensure_prefill_graph(self, S_bucket: int):
         """Lazy-capture a CUDA Graph for fresh-KV prefill at S=S_bucket.
@@ -1461,12 +1684,7 @@ class Qwen3TorchFrontendRtx:
         vocab = cfg['vocab_size']
         s = torch.cuda.current_stream().cuda_stream
         last_row = self._last_hidden_buf[0, real_S - 1:real_S].contiguous()
-        fvk.bf16_matmul_qwen36_bf16(
-            last_row.data_ptr(),
-            int(self._weights.ptrs['lm_head_w']),
-            self._logits_buf[:1].data_ptr(),
-            1, vocab, hidden, s,
-        )
+        self._lm_head_m1(last_row, vocab, hidden, s)
         _ = bucket  # silence unused warning in IDE diff view
 
         # Decode resumes at the real prompt's end, NOT the bucket end.

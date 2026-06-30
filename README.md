@@ -6,6 +6,10 @@
 
 **FlashRT is a high-performance realtime inference engine for small-batch, latency-sensitive AI workloads.**
 
+<p align="center">
+  | <a href="https://arxiv.org/abs/2606.20537"><b>Paper</b></a> |
+</p>
+
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
 The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers BAGEL world-model research paths, Higgs Audio v3 TTS, Wan2.2 / Motus video-policy paths, and **single-stream LLM inference** with Qwen3.6-27B NVFP4 long-context serving. The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
@@ -439,9 +443,14 @@ actions_normalized = model.infer(
 )
 ```
 
-GROOT N1.7 is registered as `config="groot_n17"` for the RTX SM120
-torch path. It uses the N1.7 `set_prompt(aux=...)` / normalized-state
-`infer(...)` contract; see [USAGE.md](USAGE.md#groot-n17-rtx).
+GROOT N1.7 is registered as `config="groot_n17"` for the RTX torch
+path (`rtx_sm120` and `rtx_sm89`). `rtx_sm120` keeps the shared RTX
+registration and `load_model()` refines that default to the FP8
+production frontend when `use_fp16=False`; `rtx_sm89` is registered
+directly to its dedicated FP8 frontend. `use_fp16=True, use_fp8=False`
+selects the explicit RTX reference frontend for the selected hardware. It
+uses the N1.7 `set_prompt(aux=...)` / normalized-state `infer(...)`
+contract; see [USAGE.md](USAGE.md#groot-n17-rtx).
 
 ### Autotune
 
@@ -502,9 +511,9 @@ data regardless of cache.
 ### NVFP4 encoder FFN (Pi0.5 only)
 
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5 encoder
-FFN stack. Currently implemented for **Pi0.5 torch only** — passing
+FFN stack. Implemented for **Pi0.5 torch and JAX on Thor** — passing
 `use_fp4=True` with any other config (pi0 / groot / pi0fast) emits a warning
-and falls back to FP8.
+and uses the FP8 route.
 
 ```python
 model = flash_rt.load_model(
@@ -540,8 +549,8 @@ L7-9 subset).
   `enable_llm_nvfp4` style — `output_quantizer` disabled).
 
 **Requirements**:
-- SM100+ GPU (validated on Thor SM110). Non-SM100 hardware silently falls
-  back to FP8.
+- SM100+ GPU (validated on Thor SM110). Non-SM100 hardware logs a warning
+  and uses the FP8 route.
 - `flash_rt_fp4.so` extension (built alongside `flash_rt_kernels.so`).
 
 **Measured on Thor SM110, Pi0.5 / LIBERO Spatial 10 × 50 = 500 episodes**:
@@ -563,12 +572,12 @@ stratified calibration, 50 graph replays, Thor SM110)**:
 | **NVFP4 encoder (torch)** | **31.91 ms** | **39.78 ms** | **51.51 ms** | **0.998932** |
 | **NVFP4 encoder (jax, Orbax)** | **34.39 ms** | **43.65 ms** | **56.90 ms** | **0.999030** |
 
-Encoder FP4 preserves cosine **≥ 0.9989** vs the PyTorch FP32 reference
-across view counts, with no latency regression relative to the FP8
-torch baseline. The JAX FP4 path derives NVFP4 weights directly from the
-Orbax checkpoint (no torch dependency at runtime) and uses the same
-two-phase multi-sample calibration flow as the torch FP4 path, producing
-a slightly higher cos (0.99903 vs 0.99893 at 3v, same AWQ refit tuning).
+Encoder FP4 preserves cosine **≥ 0.9989** vs the same-origin PyTorch
+reference in these Thor replay-latency checks. The JAX FP4 path derives
+NVFP4 weights directly from the Orbax checkpoint (no torch dependency at
+runtime) and uses the same two-phase multi-sample calibration flow as the
+torch FP4 path. Treat the table as Thor correctness / availability evidence,
+not a broad performance claim across every view count or host.
 Reproduce with
 [`tests/bench_pi05_thor_views.py`](tests/bench_pi05_thor_views.py)
 (defaults now include `jax_fp4`).
@@ -1021,6 +1030,25 @@ Task-level submission:
 If you contribute a hardware benchmark, include the exact command, warmup count,
 driver/CUDA/PyTorch versions, and `nvidia-smi` output. For new cards, start with
 `python examples/quickstart.py --checkpoint <...> --benchmark 20`.
+
+---
+
+## Citation
+
+If you use FlashRT for your research, please cite our paper:
+
+```bibtex
+@misc{su2026executionstatecapsules,
+  title={Execution-State Capsules: Graph-Bound Execution-State Checkpoint and Restore for Low-Latency, Small-Batch, On-Device Physical-AI Serving},
+  author={Liang Su},
+  year={2026},
+  eprint={2606.20537},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  doi={10.48550/arXiv.2606.20537},
+  url={https://arxiv.org/abs/2606.20537},
+}
+```
 
 ---
 
