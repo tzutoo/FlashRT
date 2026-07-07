@@ -387,6 +387,13 @@ from flash_rt.runtime import (
     TemporalFusionStats,
     TimedActionChunk,
 )
+
+from flash_rt.runtime.vlash import (
+    AsyncVLAShRunner,
+    VLAShChunkResult,
+    VLAShConfig,
+    VLAShStats,
+)
 ```
 
 The legacy async chunk runner is a beta inference scheduling utility for action-chunk
@@ -401,6 +408,11 @@ position-difference weights. It supports latency- and state-based chunk
 switching without changing model kernels or calibration. See
 `docs/rtc_temporal_fusion.md` for the adapter contract, configuration, deadline
 behavior, and real Pi0.5 checkpoint gate.
+
+`AsyncVLAShRunner` is an optional host-side runtime for projected-state
+action-chunk scheduling. It estimates a future robot state from the active
+chunk, injects that state into the next observation, and activates the completed
+chunk from index zero. See `docs/vlash.md`.
 
 ### `flash_rt.flash_rt_fa2`
 

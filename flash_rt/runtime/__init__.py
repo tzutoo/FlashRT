@@ -18,6 +18,12 @@ from .rtc_temporal_fusion import (
     TemporalFusionStats,
     TimedActionChunk,
 )
+from .vlash import (
+    AsyncVLAShRunner,
+    VLAShChunkResult,
+    VLAShConfig,
+    VLAShStats,
+)
 
 __all__ = [
     "ActionChunkAdapter",
@@ -34,4 +40,8 @@ __all__ = [
     "TemporalFusionConfig",
     "TemporalFusionStats",
     "TimedActionChunk",
+    "AsyncVLAShRunner",
+    "VLAShChunkResult",
+    "VLAShConfig",
+    "VLAShStats",
 ]
