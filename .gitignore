@@ -54,3 +54,6 @@ qwen36_nvfp4/
 
 # Personal opencode config (API keys)
 opencode.json
+
+# Bench logs
+logs/
