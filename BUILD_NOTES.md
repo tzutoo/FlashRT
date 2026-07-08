@@ -411,6 +411,28 @@ the 32768 default output budget, with measured steady-state decode of
 borderline, so under extreme session growth + an unlucky WSL2 free-VRAM drift
 you may see decode slow to ~30 tok/s; a `docker restart` clears it.
 
+The 240K cliff we identified in `qwen36_maxseq_sweep.py`:
+```
+max_seq   free_MiB   decode tok/s (1K ctx)
+196608      844     122
+229376      944     119   <- last safe
+245760      364      27   <- cliff
+```
+
+We briefly tried `--max-seq 229376` (224K) thinking it was a free upgrade
+(see benchmarks/qwen36_maxseq_results.md for the full data). It turned out
+to be equivalent to 192K at every input context (within 0-6%) but 22K from
+the cliff. The Phase A "free 32K capacity" was unused — no production
+workload uses 200K-224K context. Reverted to 192K for the larger cliff
+headroom (60K vs 22K).
+
+**Why not 256K?** The 256K persistent cache is 5.4 GB vs 4.6 GB at 224K,
+enough to cross the cliff. Even with the tighter-stage env vars
+(`FLASHRT_QWEN36_FP8_STAGE_CAP=131072`, etc.) decode collapses to 7-15 tok/s
+at 64K+ input context — 10× slower than 192K. To get past 240K requires
+compressing the persistent cache itself (TQ bit-pack, future option), not
+trimming the staging buffers.
+
 Two guards make 192K safe to run as the default:
 
 1. **Overflow no longer crashes the stream.** `service._reclip_max_tokens_for_engine`
@@ -428,7 +450,8 @@ Two guards make 192K safe to run as the default:
 If your sessions are small (rarely pasting whole files) and you want rock-solid
 decode speed with no restarts, `--max-seq 131072` (128K, ~3.5 GB free) is the
 bulletproof choice. The earlier sweep data is in
-`benchmarks/qwen36_graph_results.md`.
+`benchmarks/qwen36_graph_results.md` and the new 192K-vs-224K-vs-256K
+comparison is in `benchmarks/qwen36_maxseq_results.md`.
 
 ### Speculative decode K
 

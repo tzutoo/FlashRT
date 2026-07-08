@@ -1,0 +1,37 @@
+[
+  {
+    "label": "192K_orig",
+    "max_seq": 196608,
+    "free_mib": 1431,
+    "env_extras": [],
+    "results": {
+      "65536": {
+        "wall_s": 8.111040872998274,
+        "decode_tok_per_s": 82.32430365398277,
+        "prefill_ms": 7515.728966000097,
+        "decode_ms": 327.9711920004047,
+        "ttft_ms": 7553.392659001474,
+        "new_prefill_tokens": 55642,
+        "out_tokens": 27
+      },
+      "131072": {
+        "wall_s": 20.925399849000314,
+        "decode_tok_per_s": 66.28585071503113,
+        "prefill_ms": 20163.195230999918,
+        "decode_ms": 392.24057200044626,
+        "ttft_ms": 20334.960808000687,
+        "new_prefill_tokens": 111250,
+        "out_tokens": 26
+      },
+      "196608": {
+        "wall_s": 40.745755502000975,
+        "decode_tok_per_s": 40.224489596596435,
+        "prefill_ms": 39550.08074299985,
+        "decode_ms": 646.3724029999867,
+        "ttft_ms": 39907.778524000605,
+        "new_prefill_tokens": 166858,
+        "out_tokens": 26
+      }
+    }
+  }
+]
