@@ -1,3 +1,30 @@
+# FlashRT Qwen3.6 server image.
+#
+# Base: `flashrt:5090` (or the older `flashrt-base:5090` alias, see below)
+# This must be a complete FlashRT kernel image (CUTLASS, FA2, FlashRT
+# kernels) that the build server can COPY serving/ files into.
+#
+# Base image convention (READ THIS before rebuilding):
+#   The "real" base image is built from docker/Dockerfile (--tag flashrt:5090).
+#   It is a ~30GB image containing the kernel binaries and is normally
+#   built once and cached.
+#
+#   When only the server code changes (this Dockerfile), we don't rebuild
+#   the full base — we layer the serving code on top. To keep the
+#   FROM line working, we tag the most recent flashrt-server:5090 as
+#   flashrt:5090 after each build (the build_server.sh helper does this).
+#
+#   This works because the COPY serving/ below re-installs the same files
+#   we already have — only the CMD layer is unique per build. Both the
+#   base and the server end up sharing the bulk of the layers.
+#
+# If you have a fresh machine with no flashrt:5090 base:
+#   docker build -t flashrt:5090 -f docker/Dockerfile .   (~25 min cold)
+#   Then build this Dockerfile as normal.
+#
+# If you only have the existing flashrt-server:5090 (typical case after
+# a previous build), the build_server.sh helper handles the retag for you.
+
 FROM flashrt:5090
 
 RUN pip install --quiet --no-cache-dir fastapi uvicorn 'transformers<4.56'
