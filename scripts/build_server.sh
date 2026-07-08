@@ -73,7 +73,7 @@ echo "==> Disk usage:"
 docker system df | head -3
 
 echo ""
-echo "==> Next: docker run -d --name flashrt-qwen36 --gpus all --network=host \\"
+echo "==> Next: docker run -d --name flashrt-qwen36 --gpus all -p 8765:8000 \\"
 echo "         --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\"
 echo "         -v /home/tzuto/Projects/FlashRT/qwen36_nvfp4:/nvfp4:ro \\"
 echo "         -v /home/tzuto/Projects/FlashRT/qwen36_fp8:/fp8:ro \\"

@@ -120,7 +120,7 @@ Reverting to 192K costs nothing and gains safety margin.
 cat > /tmp/phaseA_runner.py << 'EOF'
 import json, urllib.request, sys
 d = json.load(open("/tmp/req.json"))
-req = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
+req = urllib.request.Request("http://127.0.0.1:8765/v1/chat/completions",
     data=json.dumps(d).encode(),
     headers={"Content-Type": "application/json"},
     method="POST")

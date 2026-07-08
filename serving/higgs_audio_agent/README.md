@@ -38,13 +38,13 @@ Synthesize (OpenAI `audio/speech`-compatible):
 
 ```bash
 # WAV
-curl -s http://127.0.0.1:8000/v1/audio/speech \
+curl -s http://127.0.0.1:8765/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model":"higgs-audio-v3-tts-4b","input":"Hello from FlashRT.","response_format":"wav"}' \
   -o hello.wav
 
 # raw 24 kHz mono PCM16, streamed as it is generated
-curl -N http://127.0.0.1:8000/v1/audio/speech \
+curl -N http://127.0.0.1:8765/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"input":"Streaming low-latency speech.","response_format":"pcm"}' > out.pcm
 ```

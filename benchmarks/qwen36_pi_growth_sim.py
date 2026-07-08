@@ -11,7 +11,7 @@ Usage: python3 verify_pi_growth.py <max_seq_label>
 from __future__ import annotations
 import json, subprocess, time, urllib.request
 
-BASE = "http://127.0.0.1:8000"
+BASE = "http://127.0.0.1:8765"
 
 def free_mib():
     o = subprocess.check_output(

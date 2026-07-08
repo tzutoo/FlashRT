@@ -32,7 +32,7 @@ Usage:
     # serving envelope, or --warmup-preset none to skip.
 
     # Test (non-streaming):
-    curl http://localhost:8000/v1/chat/completions \\
+    curl http://localhost:8765/v1/chat/completions \\
         -H "Content-Type: application/json" \\
         -d '{
               "model": "qwen3.6-27b-nvfp4",
@@ -43,7 +43,7 @@ Usage:
 
     # OpenAI Python client:
     #   from openai import OpenAI
-    #   client = OpenAI(base_url="http://localhost:8000/v1", api_key="-")
+    #   client = OpenAI(base_url="http://localhost:8765/v1", api_key="-")
     #   resp = client.chat.completions.create(
     #       model="qwen3.6-27b-nvfp4",
     #       messages=[{"role": "user", "content": "Hi"}],

@@ -2,10 +2,11 @@
 """Phase A A/B bench: --max-seq 196608 (192K, current) vs 229376 (224K, new).
 
 WSL2-aware variant: uses 'docker exec <name> curl ...' to make HTTP calls,
-because WSL2 host networking doesn't expose the container's host-network
-port 8000 to localhost on the WSL side. The container is started with
---network=host so the server's port 8000 is bound inside the container
-network namespace; we run curl from inside that namespace.
+because WSL2 + Docker Desktop's port forwarder (/forwards/expose) returns
+500 for port 8000 specifically. The container is started with
+-p 8765:8000 (bridge network with port mapping); the server's internal
+port 8000 is bound inside the container, and we run curl from inside
+that namespace via docker exec. From the WSL2 host, use port 8765.
 
 Goal: confirm the move 192K -> 224K has zero decode regression on the
 realistic agent context sizes (1K, 8K, 16K, 32K). VRAM headroom is
@@ -35,7 +36,7 @@ def sh(cmd, check=False):
 def start_container(image: str, max_seq: int, name: str) -> bool:
     sh(f"docker rm -f {name} 2>/dev/null")
     sh(
-        f"docker run --restart always --gpus all --network=host --ipc=host "
+        f"docker run --gpus all --ipc=host -p 8765:8000 "
         f"--ulimit memlock=-1 --ulimit stack=67108864 "
         f"--stop-timeout 30 -d --name {name} "
         f"-v {NVFP4}:/nvfp4:ro -v {FP8}:/fp8:ro "

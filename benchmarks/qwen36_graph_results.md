@@ -211,6 +211,6 @@ docker run ... -e FLASHRT_QWEN36_TQ_VERIFY_GRAPH=1 \
     --host 0.0.0.0 --port 8000
 
 # Sweep:
-python3 benchmarks/qwen36_graph_sweep.py --url http://127.0.0.1:8000 \
+python3 benchmarks/qwen36_graph_sweep.py --url http://127.0.0.1:8765 \
     --contexts 1024 4096 16384 32768 --out-tokens 200
 ```

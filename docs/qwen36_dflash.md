@@ -149,7 +149,7 @@ generation and accept-length telemetry:
 ```bash
 python -m serving.qwen36_dflash_agent.server \
   --checkpoint /models/Qwen3.6-27B-NVFP4 --max-seq 32768 --K 15
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8765/health
 ```
 
 For long-running agent sessions (prefix reuse, tool calling, SSE

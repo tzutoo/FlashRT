@@ -33,7 +33,7 @@ Usage::
         --port 8000 \\
         --warmup-preset auto
 
-    curl http://localhost:8000/v1/chat/completions \\
+    curl http://localhost:8765/v1/chat/completions \\
         -H 'Content-Type: application/json' \\
         -d '{"model":"qwen3-8b-nvfp4",
              "messages":[{"role":"user","content":"Hi"}],

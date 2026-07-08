@@ -36,7 +36,7 @@ python -m serving.qwen36_agent.server \
   --route-min-seq 0 \
   --default-K 4 \
   --host 127.0.0.1 --port 8000
-# startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
+# startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8765
 ```
 
 Do not set `FLASHRT_QWEN36_TQ_VERIFY_GRAPH=1` or
@@ -48,14 +48,14 @@ graph-replay benchmarks.
 **2. Check it is up**
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/models
-curl -s http://127.0.0.1:8000/health      # model, max_seq, live sessions
+curl -s http://127.0.0.1:8765/v1/models
+curl -s http://127.0.0.1:8765/health      # model, max_seq, live sessions
 ```
 
 **3. A chat completion (OpenAI-compatible)**
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+curl -s http://127.0.0.1:8765/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen36-27b",
   "messages": [{"role": "user", "content": "Write a Python one-liner to reverse a string."}],
   "max_tokens": 128
@@ -68,7 +68,7 @@ telemetry (see [Response fields](#response-fields)).
 **4. Streaming (Server-Sent Events)**
 
 ```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+curl -N http://127.0.0.1:8765/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen36-27b", "stream": true,
   "messages": [{"role": "user", "content": "Explain a hash map in two sentences."}],
   "max_tokens": 128

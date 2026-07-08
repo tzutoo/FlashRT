@@ -49,7 +49,7 @@ python examples/qwen3_openai_server.py \
     --warmup-preset auto
 
 # 2. Call it like any OpenAI v1 endpoint
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8765/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{
         "model": "qwen3-8b-nvfp4",
@@ -59,13 +59,13 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 Startup is ~9 s (3 s checkpoint load + 6 s graph warmup). The server
-is ready when uvicorn logs `Uvicorn running on http://0.0.0.0:8000`.
+is ready when uvicorn logs `Uvicorn running on http://0.0.0.0:8765`.
 
 ```python
 # Or via the OpenAI Python SDK
 from openai import OpenAI
 
-client = OpenAI(base_url='http://localhost:8000/v1', api_key='not-required')
+client = OpenAI(base_url='http://localhost:8765/v1', api_key='not-required')
 
 resp = client.chat.completions.create(
     model='qwen3-8b-nvfp4',

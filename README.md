@@ -360,7 +360,7 @@ export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
 python -m serving.qwen36_agent.server \
     --checkpoint /path/to/qwen36_nvfp4 \
     --port 8000
-# Then: curl http://localhost:8000/v1/chat/completions ...
+# Then: curl http://localhost:8765/v1/chat/completions ...
 ```
 
 ### Framework Choice

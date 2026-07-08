@@ -10,7 +10,7 @@ URLs). Single-GPU, batch 1; concurrent requests are serialised.
     python examples/qwen3_vl_openai_server.py \\
         --checkpoint /path/to/Qwen3-VL-8B-FlashRT-NVFP4 --port 8000
 
-    curl http://localhost:8000/v1/chat/completions \\
+    curl http://localhost:8765/v1/chat/completions \\
         -H 'Content-Type: application/json' \\
         -d '{"model":"qwen3-vl","messages":[{"role":"user","content":[
               {"type":"image_url","image_url":{"url":"https://.../x.png"}},

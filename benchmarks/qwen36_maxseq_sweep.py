@@ -21,9 +21,9 @@ def sh(cmd): return subprocess.run(cmd, shell=True, capture_output=True, text=Tr
 
 def restart(maxseq):
     sh("docker rm -f flashrt-qwen36 2>/dev/null")
-    r = sh(f"docker run --restart always --gpus all --ipc=host "
+    r = sh(f"docker run --gpus all --ipc=host "
            f"--ulimit memlock=-1 --ulimit stack=67108864 "
-           f"--stop-timeout 30 -p 8000:8000 -d --name flashrt-qwen36 "
+           f"--stop-timeout 30 -p 8765:8000 -d --name flashrt-qwen36 "
            f"-v {NVFP4}:/nvfp4:ro -v {FP8}:/fp8:ro "
            f"-e FLASHRT_QWEN36_MTP_CKPT_DIR=/fp8 -e FLASHRT_QWEN36_LONG_KV_CACHE=fp8 "
            f"-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
@@ -35,7 +35,7 @@ def restart(maxseq):
     if r.returncode != 0: return False
     for _ in range(120):
         try:
-            req = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
+            req = urllib.request.Request("http://127.0.0.1:8765/v1/chat/completions",
                 data=json.dumps({"model":"qwen36-27b","messages":[{"role":"user","content":"hi"}],"max_tokens":3}).encode(),
                 headers={"Content-Type":"application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=60) as resp: resp.read()
@@ -53,16 +53,16 @@ def measure(ctx):
     body = {"model":"qwen36-27b","messages":[{"role":"user","content":f+"\nCount from 1 to 100, one per line."}],
             "max_tokens":OUT,"stream":False,
             "flashrt_session_id":f"m{ctx}-{time.time_ns()}","flashrt_cache_salt":f"m{ctx}-{time.time_ns()}"}
-    req = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
+    req = urllib.request.Request("http://127.0.0.1:8765/v1/chat/completions",
         data=json.dumps(body).encode(), headers={"Content-Type":"application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=400) as r: d = json.loads(r.read())
     return d["flashrt"]["decode_tok_per_s"]
 
 def delete_all():
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5) as r: h=json.loads(r.read())
+        with urllib.request.urlopen("http://127.0.0.1:8765/health",timeout=5) as r: h=json.loads(r.read())
         for s in h.get("sessions",{}).get("sessions",[]):
-            sh(f"curl -s -X DELETE http://127.0.0.1:8000/v1/sessions/{s.get('session_id')} >/dev/null")
+            sh(f"curl -s -X DELETE http://127.0.0.1:8765/v1/sessions/{s.get('session_id')} >/dev/null")
     except Exception: pass
 
 def main():

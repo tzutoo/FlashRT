@@ -32,7 +32,7 @@ Run it once per graph mode. The server's current graph mode is printed from
           flashrt-server:5090 --max-seq 32768 --route-min-seq 0
 
 Usage:
-    python3 benchmarks/qwen36_graph_sweep.py --url http://127.0.0.1:8000
+    python3 benchmarks/qwen36_graph_sweep.py --url http://127.0.0.1:8765
         --contexts 1024 4096 16384 32768 --out-tokens 128
 """
 
@@ -132,7 +132,7 @@ def _fmt_speed(v) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", default="http://127.0.0.1:8000",
+    ap.add_argument("--url", default="http://127.0.0.1:8765",
                     help="Server base URL (default: %(default)s)")
     ap.add_argument("--model", default="qwen36-27b")
     ap.add_argument("--contexts", type=int, nargs="+",

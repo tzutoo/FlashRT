@@ -1252,7 +1252,7 @@ If `images` is omitted, dummy random images are used (for testing).
 
 ```bash
 # Simple test (dummy images)
-curl -X POST http://localhost:8000/predict \
+curl -X POST http://localhost:8765/predict \
     -H "Content-Type: application/json" \
     -d '{"prompt": "pick up the red block"}'
 
@@ -1261,7 +1261,7 @@ python -c "
 import requests, base64, numpy as np
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
 b64 = base64.b64encode(img.tobytes()).decode()
-resp = requests.post('http://localhost:8000/predict', json={
+resp = requests.post('http://localhost:8765/predict', json={
     'prompt': 'pick up the red block',
     'images': [b64, b64],
 })

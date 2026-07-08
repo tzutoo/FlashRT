@@ -32,7 +32,7 @@ python -m serving.omnivoice_agent.server \
 Clone mode (with reference audio):
 
 ```bash
-curl -s http://127.0.0.1:8000/predictions \
+curl -s http://127.0.0.1:8765/predictions \
   -H 'Content-Type: application/json' \
   -d '{
     "input": {
@@ -50,7 +50,7 @@ s=d.split(',')[1]; open('out.wav','wb').write(base64.b64decode(s))"
 Design mode (text-described voice):
 
 ```bash
-curl -s http://127.0.0.1:8000/predictions \
+curl -s http://127.0.0.1:8765/predictions \
   -H 'Content-Type: application/json' \
   -d '{
     "input": {

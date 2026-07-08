@@ -17,7 +17,7 @@ Usage:
         --framework jax
 
     # Test:
-    curl -X POST http://localhost:8000/predict \
+    curl -X POST http://localhost:8765/predict \
         -H "Content-Type: application/json" \
         -d '{"prompt": "pick up the red block", "image_shape": [224, 224, 3]}'
 """

@@ -259,7 +259,7 @@ request body if you want the model's thinking-mode template.
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url='http://localhost:8000/v1', api_key='-')
+client = OpenAI(base_url='http://localhost:8765/v1', api_key='-')
 
 tools = [{
     'type': 'function',

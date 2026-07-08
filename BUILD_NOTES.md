@@ -104,7 +104,7 @@ WORKDIR /workspace/FlashRT
 EXPOSE 8000
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" || exit 1
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8765/health', timeout=5)" || exit 1
 
 CMD ["python3", "-m", "serving.qwen36_agent.server", "--checkpoint", "/nvfp4", \
      "--max-seq", "196608", "--route-min-seq", "0", \
@@ -160,11 +160,16 @@ hf download Qwen/Qwen3.6-27B-FP8 --local-dir ./qwen36_fp8                # ~29 G
 
 ## Step 4: Start the Server Container
 
+**Manual start, no auto-restart, port 8765.** WSL2 + Docker Desktop's port
+forwarder (`/forwards/expose`) returns HTTP 500 for port 8000 specifically —
+use 8765 on the host side (container still listens on 8000 internally).
+No `--restart` flag: the container only runs when you explicitly start it.
+
 ```bash
-docker run --restart always --gpus all --ipc=host \
+docker run --gpus all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     --stop-timeout 30 \
-    -p 8000:8000 -d \
+    -p 8765:8000 -d \
     --name flashrt-qwen36 \
     -v $(pwd)/qwen36_nvfp4:/nvfp4:ro \
     -v $(pwd)/qwen36_fp8:/fp8:ro \
@@ -175,6 +180,13 @@ docker run --restart always --gpus all --ipc=host \
     -e TRANSFORMERS_OFFLINE=1 \
     flashrt-server:5090
 ```
+
+| Flag | Value | Why |
+|------|-------|-----|
+| `-p 8765:8000` | Bridge port mapping | Docker Desktop's WSL2 forwarder returns 500 for host port 8000; 8765 works |
+| _(no `--restart`)_ | `no` (default) | Manual start only — container does not survive crashes or reboots automatically |
+| `--gpus all` | GPU passthrough | Required for CUDA on Blackwell |
+| `--ipc=host` | Shared IPC | CUDA IPC for efficient GPU memory sharing |
 
 The Dockerfile bakes in:
 - `--max-seq 196608` (192K context window)
@@ -197,10 +209,10 @@ normally completes in 1–3 s.
 Startup takes ~10s. Verify:
 
 ```bash
-curl -s http://localhost:8000/v1/models/qwen36-27b
+curl -s http://localhost:8765/v1/models/qwen36-27b
 # {"id":"qwen36-27b","object":"model","owned_by":"flash-rt","context_length":196608,"max_output_tokens":65536}
 
-curl -s http://localhost:8000/v1/chat/completions \
+curl -s http://localhost:8765/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{"model":"qwen36-27b","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
 ```
@@ -243,7 +255,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
       "npm": "@ai-sdk/openai-compatible",
       "name": "FlashRT (local RTX 5090)",
       "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
+        "baseURL": "http://127.0.0.1:8765/v1",
         "apiKey": "-",
         "headers": { "Authorization": "Bearer -" }
       },
@@ -266,7 +278,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
 | Provider name | `flashrt` (custom) | Built-in `openai` ignores `baseURL` |
 | `npm` | `@ai-sdk/openai-compatible` | Required for custom endpoints |
 | `temperature` | `false` | Server is greedy-only (no sampling) |
-| `baseURL` | `http://127.0.0.1:8000/v1` | Must include `/v1`. Server binds `0.0.0.0` for WSL2 |
+| `baseURL` | `http://127.0.0.1:8765/v1` | Must include `/v1`. Server binds `0.0.0.0` for WSL2 |
 | `limit.context` / `limit.output` | `196608` / `32768` | Must match the server (see output-budget note) |
 
 ### pi
@@ -278,7 +290,7 @@ Place in `opencode.json` in your project root (or `~/.config/opencode/opencode.j
 {
   "providers": {
     "flashrt": {
-      "baseUrl": "http://127.0.0.1:8000/v1",
+      "baseUrl": "http://127.0.0.1:8765/v1",
       "api": "openai-completions",
       "apiKey": "-",
       "compat": { "supportsDeveloperRole": true },
@@ -315,7 +327,7 @@ Restart pi after editing — it reads `models.json` at launch, not per request.
 ```yaml
 custom_providers:
 - name: flashrt                       # meaningful name (NOT a UUID)
-  base_url: http://127.0.0.1:8000/v1
+  base_url: http://127.0.0.1:8765/v1
   api_key: '-'
   models:
     qwen36-27b:
@@ -678,9 +690,10 @@ You should see the `release_gpu: CUDA context torn down` line in
 ## GPU Health Monitoring
 
 The healthcheck uses `GET /health` — returns `{"status":"ok"}` without GPU
-inference. Zero VRAM overhead, zero interference with active requests. If the
-server crashes (CUDA error, OOM, segfault), Docker's `--restart always`
-restarts automatically.
+inference. Zero VRAM overhead, zero interference with active requests. The
+container is **manually started** (no `--restart` policy); if the server
+crashes (CUDA error, OOM, segfault), you'll see it in `docker logs` and
+restart by hand with `docker start flashrt-qwen36`.
 
 | Parameter | Value | Why |
 |-----------|-------|-----|

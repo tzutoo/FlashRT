@@ -56,7 +56,7 @@ def sh(cmd, check=False):
 def start_container(image, max_seq, name) -> bool:
     sh(f"docker rm -f {name} 2>/dev/null")
     sh(
-        f"docker run --restart always --gpus all --network=host --ipc=host "
+        f"docker run --gpus all --ipc=host -p 8765:8000 "
         f"--ulimit memlock=-1 --ulimit stack=67108864 "
         f"--stop-timeout 30 -d --name {name} "
         f"-v {NVFP4}:/nvfp4:ro -v {FP8}:/fp8:ro "

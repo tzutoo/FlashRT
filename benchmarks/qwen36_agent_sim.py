@@ -15,7 +15,7 @@ Run once per config (restart the container between).
 from __future__ import annotations
 import json, time, urllib.request
 
-BASE = "http://127.0.0.1:8000"
+BASE = "http://127.0.0.1:8765"
 
 def post(body, timeout=300):
     req = urllib.request.Request(f"{BASE}/v1/chat/completions",

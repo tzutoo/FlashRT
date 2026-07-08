@@ -53,14 +53,14 @@ override with `--arch thor|rtx`.
 **2. Check it is up**
 
 ```bash
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8765/health
 # {"status":"ok","arch":"thor","path":"dflash","pertoken_window":true,...}
 ```
 
 **3. Chat completion**
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
+curl -s http://127.0.0.1:8765/v1/chat/completions \
   -H 'Content-Type: application/json' -d '{
     "model": "qwen3.6-27b-dflash",
     "messages": [{"role": "user", "content":
